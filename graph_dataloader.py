@@ -1,6 +1,6 @@
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
-from graph_utils import arc_graph
+from graph_utils import ArcGraph
 from tqdm import tqdm
 import os
 from datetime import datetime
@@ -47,6 +47,30 @@ class DataGenerator():
             A[selected_preds, i] = 1
         
         return A
+
+    def generate_dataset(self, n_samples):
+        pbar = tqdm(range(n_samples))
+        V = []
+        Y = []
+        for _ in pbar:
+            A = self.sample_A()
+            g = ArcGraph(search_space=self.search_space, X=None, A=A)
+            g.sample_node_features(self.input_shape)
+            g.is_valid(self.input_shape)
+            g.add_latent_shapes(self.input_shape)
+            g.add_n_params_and_FlOPs()
+            v = g.to_V()
+            n_params = g.count_params()
+            FLOPs = g.count_FLOPs()
+            V.append(v)
+            Y.append(torch.Tensor([n_params, FLOPs]))
+            pbar.set_description(f"Sampling valid graphs...")
+
+        V = torch.stack(V)
+        Y = torch.stack(Y)
+        current_datetime = datetime.now().strftime("%m%d_%H%M")
+        path = os.path.join(declare_dir_path(os.path.join(self.exp_dir, "graph_data")), f"{n_samples}_samples_{current_datetime}.pt")
+        torch.save({'V': V,'Y': Y}, path)
     
 class _RepeatSampler(object):
     def __init__(self, sampler):
@@ -84,30 +108,6 @@ class MultiEpochsDataLoader(DataLoader):
     def __iter__(self):
         for _ in range(len(self)):
             yield next(self.iterator)
-
-    def generate_dataset(self, n_samples):
-        pbar = tqdm(range(n_samples))
-        V = []
-        Y = []
-        for k in pbar:
-            A = self.sample_A()
-            g = arc_graph(search_space=self.search_space, X=None, A=A)
-            g.sample_node_features(self.input_shape)
-            g.is_valid(self.input_shape)
-            g.add_latent_shapes(self.input_shape)
-            g.add_n_params_and_FlOPs()
-            v = g.to_V()
-            n_params = g.count_params()
-            FLOPs = g.count_FLOPs()
-            V.append(v)
-            Y.append(torch.Tensor([n_params, FLOPs]))
-            pbar.set_description(f"Sampling valid graphs...")
-
-        V = torch.stack(V)
-        Y = torch.stack(Y)
-        current_datetime = datetime.now().strftime("%m%d_%H%M")
-        path = os.path.join(declare_dir_path(os.path.join(self.exp_dir, "graph_data")), f"{n_samples}_samples_{current_datetime}.pt")
-        torch.save({'V': V,'Y': Y}, path)
 
 
 class GraphDataset(Dataset):

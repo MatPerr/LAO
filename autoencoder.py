@@ -1,4 +1,4 @@
-from graph_utils import arc_graph
+from graph_utils import ArcGraph
 from search_space import SearchSpace
 from graph_dataloader import get_dataloaders
 
@@ -6,13 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import _LRScheduler
-from torch.nn.parallel import parallel_apply
 from torch.utils.tensorboard import SummaryWriter
 
 import os
 from datetime import datetime
 from tqdm import tqdm
 import math
+
 
 def get_device():
         if torch.backends.mps.is_available():
@@ -23,6 +23,7 @@ def get_device():
         
         else: 
             return "cpu"
+
 
 class NonNegativeLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias=True):
@@ -87,6 +88,7 @@ class ICNN(nn.Module):
             y = y.squeeze(0)
         return y
     
+
 def SMMD_RBF_gaussian_prior(z, scale=1/8, adaptive=True):
     batch_size = z.size(0)
     z_dim = z.size(1)
@@ -118,6 +120,7 @@ def SMMD_RBF_gaussian_prior(z, scale=1/8, adaptive=True):
     
     return torch.clamp(variance_normalization * (Ekzz - 2. * Ekzn + Eknn), min=0.0)
 
+
 class CosineAnnealingAlphaLR(_LRScheduler):
     def __init__(self, optimizer, T_max, alpha, last_epoch=-1):
         self.T_max = T_max
@@ -129,6 +132,7 @@ class CosineAnnealingAlphaLR(_LRScheduler):
             base_lr * (self.alpha + 0.5 * (1 - self.alpha) * (1 + math.cos(math.pi * self.last_epoch / self.T_max)))
             for base_lr in self.base_lrs
         ]
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, hidden_size):
@@ -254,7 +258,7 @@ class ArcAE(nn.Module):
 
         return v_hat
     
-    def loss(self, v, y, beta=0., gamma=1e-3):
+    def loss(self, v, y):
         batch_size = v.shape[0]
 
         # Encode and decode input
@@ -315,11 +319,19 @@ class ArcAE(nn.Module):
             reg = SMMD_RBF_gaussian_prior(z)
             reg_name = 'MMD'
         elif self.ae_type == 'AE':
-            reg = z.pow(2).sum(1).mean()
+            reg = torch.maximum(torch.abs(z)-3.0, torch.zeros_like(z)).pow(2).sum(1).mean()
+            reg += z.mean(0).pow(2).sum()
             reg_name = 'L2'
 
+        # Total loss
+        loss = recon_loss
+        if self.beta > 0:
+            loss += self.beta*reg
+        if self.gamma > 0:
+            loss += self.gamma*pred_loss
+
         return {
-            'loss': recon_loss + beta*reg + gamma*pred_loss, 
+            'loss': loss, 
             'recon': recon_loss, 
             reg_name: reg, 
             'pred': pred_loss,
@@ -332,196 +344,50 @@ class ArcAE(nn.Module):
             'FLOPs_loss': FLOPs_loss
         }
 
-    
-    def train_loop_old(self, train_dl, val_dl, iterations, lr=1e-3, log_dir="runs/arc_ae",
-        save_dir="checkpoints", save_every=10_000,
-        val_every=10_000):
-    
-        device = get_device()
-        self.to(device)
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-        scheduler = CosineAnnealingAlphaLR(optimizer, T_max=iterations, alpha=1e-4)
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(save_dir, f"arcae_{timestamp}")
-        writer = SummaryWriter(os.path.join(log_dir, f"{timestamp}"))
-        os.makedirs(save_dir, exist_ok=True)
+    def log_latent_space(self, train_dl, writer, global_step, device, num_samples=10_000):
+        self.eval()  # Set model to evaluation mode
+        all_z = []
         
-        self.train()
-        global_step = 0
-        pbar = tqdm(range(iterations), desc="Training")
-        best_val_loss = float('inf')
-        while global_step < iterations:
-            for v, y in train_dl:
-                # Train logic                   
+        # Create a dataloader with a fixed batch size to collect samples
+        sample_count = 0
+        with torch.no_grad():
+            for v, _ in tqdm(train_dl, desc="Encoding inputs for latent histograms", leave=False):
+                if sample_count >= num_samples:
+                    break
                 v = v.to(device)
-                y = y.to(device)
-                optimizer.zero_grad()
-                loss_dict = self.loss(v, y)
-                loss = loss_dict['loss']
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                
-                # Train metrics Tensorboard logging
-                for key, value in loss_dict.items():
-                    if isinstance(value, torch.Tensor):
-                        writer.add_scalar(f"train/{key}", value.item(), global_step)
-                
-                # Train metrics display
-                desc_parts = [""]
-                for key in list(loss_dict.keys())[0:5]:
-                    value = loss_dict[key]
-                    if isinstance(value, torch.Tensor):
-                        desc_parts.append(f"{key}: {value.item():.2e}")
-                pbar.set_description(" ".join(desc_parts))
-                
-                # Validation
-                if (global_step + 1) % val_every == 0:
-                    # Val logic
-                    self.eval()
-                    val_losses = {k: 0.0 for k in loss_dict.keys()}
-                    val_count = 0
-                    with torch.no_grad():
-                        for val_v, val_y in tqdm(val_dl, desc="Validating", leave=False):
-                            val_v = val_v.to(device)
-                            val_y = val_y.to(device)
-                            val_loss_dict = self.loss(val_v, val_y)
-                            
-                            for k, v in val_loss_dict.items():
-                                if isinstance(v, torch.Tensor):
-                                    val_losses[k] += v.item()
-                            val_count += 1
-                    
-                    # Val metrics Tensorboard logging
-                    for k in val_losses.keys():
-                        val_losses[k] /= max(val_count, 1)
-                        writer.add_scalar(f"val/{k}", val_losses[k], global_step)
-                    
-                    # Val metrics display
-                    val_msg_parts = [f"Iteration {global_step+1}/{iterations} |"]
-                    for k, v in val_losses.items():
-                        val_msg_parts.append(f"Val {k}: {v:.2e}")
-                    tqdm.write(" ".join(val_msg_parts))
-                    
-                    # Save model checkpoint if best so far
-                    if val_losses['loss'] < best_val_loss:
-                        best_val_loss = val_losses['loss']
-                        best_checkpoint_path = os.path.join(save_dir, "arcae_best.pt")
-                        torch.save({
-                            'iteration': global_step + 1,
-                            'model_state_dict': self.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'val_loss': best_val_loss,
-                            'all_losses': val_losses
-                        }, best_checkpoint_path)
-                        tqdm.write(f"New best model saved with validation loss: {best_val_loss:.4f}")
-                    
-                    self.train()
-                
-                # Save model checkpoint as scheduled
-                if (global_step + 1) % save_every == 0:
-                    checkpoint_path = os.path.join(save_dir, f"arcae_iter_{global_step+1}.pt")
-                    torch.save({
-                        'iteration': global_step + 1,
-                        'model_state_dict': self.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': loss.item(),
-                        'all_losses': {k: v.item() if isinstance(v, torch.Tensor) else v 
-                                    for k, v in loss_dict.items()}
-                    }, checkpoint_path)
-                    tqdm.write(f"Checkpoint saved to {checkpoint_path}")
-                
-                global_step += 1
-                pbar.update(1)
+                mu, logvar = self.encode(v)
+                z = self.reparameterize(mu, logvar)
+                all_z.append(z.cpu())
+                sample_count += v.size(0)
         
-        # Save final model
-        final_checkpoint_path = os.path.join(save_dir, "arcae_final.pt")
-        torch.save({
-            'iteration': iterations,
-            'model_state_dict': self.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss.item() if 'loss' in locals() else None,
-            'all_losses': {k: v.item() if isinstance(v, torch.Tensor) else v 
-                        for k, v in loss_dict.items()} if 'loss_dict' in locals() else {}
-        }, final_checkpoint_path)
-        tqdm.write(f"Final model saved to {final_checkpoint_path}")
+        # Combine all batches
+        all_z = torch.cat(all_z, dim=0)[:num_samples]  
         
-        writer.close()
-        return val_losses
-    
-    def train_loop(self, train_dl, val_dl, iterations, lr=1e-3, log_dir="runs/arc_ae",
+        # Log histograms for each dimension
+        z_dim = all_z.size(1)
+        for i in range(z_dim):
+            writer.add_histogram(f'latent/z_dim_{i}', all_z[:, i], global_step)
+        
+        self.train()  # Switch back to training mode
+        return all_z
+
+
+    def train_loop(self, train_dl, val_dl, iterations, lr=1e-3, log_dir="runs/arc_ae", beta=1e-2, gamma=1e-3,
         save_dir="checkpoints", save_every=50_000,
-        val_every=15_000, vis_latent_every=15_000, num_samples=10_000):
+        val_every=15_000, log_latent_every=15_000):
+
+        self.beta = beta
+        self.gamma = gamma
     
         device = get_device()
         self.to(device)
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-        scheduler = CosineAnnealingAlphaLR(optimizer, T_max=iterations, alpha=1e-4)
+        scheduler = CosineAnnealingAlphaLR(optimizer, T_max=0.9*iterations, alpha=1e-4)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir = os.path.join(save_dir, f"arcae_{timestamp}")
         writer = SummaryWriter(os.path.join(log_dir, f"{timestamp}"))
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Function to visualize latent space distributions
-        def visualize_latent_space():
-            self.eval()
-            all_z = []
-            
-            # Create a dataloader with a fixed batch size to collect samples
-            sample_count = 0
-            with torch.no_grad():
-                for v, _ in tqdm(train_dl, desc="Encoding for visualization", leave=False):
-                    if sample_count >= num_samples:
-                        break
-                    
-                    v = v.to(device)
-                    # Get latent representation (z)
-                    mu, logvar = self.encode(v)
-                    z = self.reparameterize(mu, logvar)
-                    all_z.append(z.cpu())
-                    
-                    sample_count += v.size(0)
-            
-            # Combine all batches
-            all_z = torch.cat(all_z, dim=0)[:num_samples]  # Limit to the requested number of samples
-            
-            # Log histograms for each dimension
-            z_dim = all_z.size(1)
-            for i in range(z_dim):
-                writer.add_histogram(f'latent/z_dim_{i}', all_z[:, i], global_step)
-            
-            # For visualizing latent space
-            if z_dim > 1:  # Only create grid if there are multiple dimensions
-                try:
-                    import matplotlib.pyplot as plt
-                    import numpy as np
-                    from math import ceil, sqrt
-                    
-                    # Calculate grid dimensions
-                    grid_size = ceil(sqrt(z_dim))
-                    fig, axes = plt.subplots(grid_size, grid_size, figsize=(15, 15))
-                    axes = axes.flatten()
-                    
-                    for i in range(z_dim):
-                        if i < len(axes):  # Safety check
-                            ax = axes[i]
-                            ax.hist(all_z[:, i].numpy(), bins=50)
-                            ax.set_title(f'Dimension {i}')
-                            ax.set_ylabel('Frequency')
-                    
-                    # Hide unused subplots
-                    for i in range(z_dim, len(axes)):
-                        axes[i].axis('off')
-                    
-                    fig.tight_layout()
-                    writer.add_figure('latent/z_distributions_grid', fig, global_step)
-                    plt.close(fig)
-                except Exception as e:
-                    print(f"Could not create grid figure: {e}")
-            
-            self.train()  # Switch back to training mode
         
         self.train()
         global_step = 0
@@ -539,12 +405,12 @@ class ArcAE(nn.Module):
                 optimizer.step()
                 scheduler.step()
                 
-                # Train metrics Tensorboard logging
+                # Log train metrics in Tensorboard
                 for key, value in loss_dict.items():
                     if isinstance(value, torch.Tensor):
                         writer.add_scalar(f"train/{key}", value.item(), global_step)
                 
-                # Train metrics display
+                # Display train metrics with progress bar
                 desc_parts = [""]
                 for key in list(loss_dict.keys())[0:5]:
                     value = loss_dict[key]
@@ -552,10 +418,10 @@ class ArcAE(nn.Module):
                         desc_parts.append(f"{key}: {value.item():.2e}")
                 pbar.set_description(" ".join(desc_parts))
                 
-                # Visualize latent space distributions
-                if (global_step + 1) % vis_latent_every == 0:
-                    tqdm.write(f"Visualizing latent space distributions at step {global_step+1}")
-                    visualize_latent_space()
+                # Log latent space distributions
+                if (global_step + 1) % log_latent_every == 0:
+                    tqdm.write(f"Logging latent space distributions at step {global_step+1}")
+                    self.log_latent_space(train_dl, writer, global_step, device)
                 
                 # Validation
                 if (global_step + 1) % val_every == 0:
@@ -574,12 +440,12 @@ class ArcAE(nn.Module):
                                     val_losses[k] += v.item()
                             val_count += 1
                     
-                    # Val metrics Tensorboard logging
+                    # Log val metrics in Tensorboard
                     for k in val_losses.keys():
                         val_losses[k] /= max(val_count, 1)
                         writer.add_scalar(f"val/{k}", val_losses[k], global_step)
                     
-                    # Val metrics display
+                    # Display val metrics
                     val_msg_parts = [f"Iteration {global_step+1}/{iterations} |"]
                     for k, v in val_losses.items():
                         val_msg_parts.append(f"Val {k}: {v:.2e}")
@@ -597,10 +463,6 @@ class ArcAE(nn.Module):
                             'all_losses': val_losses
                         }, best_checkpoint_path)
                         tqdm.write(f"New best model saved with validation loss: {best_val_loss:.4f}")
-                        
-                        # Also visualize latent space when saving best model
-                        tqdm.write("Visualizing latent space for best model")
-                        visualize_latent_space()
                     
                     self.train()
                 
@@ -623,9 +485,9 @@ class ArcAE(nn.Module):
                 if global_step >= iterations:
                     break
         
-        # Visualize latent space distributions for final model
-        tqdm.write("Visualizing latent space distributions for final model")
-        visualize_latent_space()
+        # Log latent space distributions for final model
+        tqdm.write("Logging latent space distributions for final model")
+        self.log_latent_space(train_dl, writer, global_step, device)
         
         # Save final model
         final_checkpoint_path = os.path.join(save_dir, "arcae_final.pt")
@@ -648,5 +510,5 @@ train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch
 
 from search_space import *
 
-ae_model = ArcAE(search_space = SearchSpace(), z_dim = 180)
+ae_model = ArcAE(search_space = SearchSpace(), z_dim = 139, ae_type = "AE",)
 ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, log_dir="runs/arc_ae", save_dir="checkpoints")
