@@ -33,6 +33,7 @@ def format_number_spaces(number):
     
     return formatted_string[::-1]
 
+
 class ArcGraph(ig.Graph):
     def __init__(self, search_space=None, X=None, A=None, V=None, n_nodes=None):
         super().__init__(directed=True)
@@ -366,10 +367,11 @@ class ArcGraph(ig.Graph):
             
             # FLOPs
             conv_FLOPs = (2*(input_breadth**2)*(kernel_size**2)*input_channels*out_channels) // ((stride**2)*groups)
-            # NOTE: 3* to match deepspeed's way of counting, but I think it should be 2*
+            # NOTE: 4* during training and 2* during inference, averaged to 3*
             bn_FLOPs = 3*out_channels*(input_breadth // stride)**2
             act_flops = out_channels*(input_breadth // stride)**2
             FLOPs = conv_FLOPs + bn_FLOPs + act_flops
+
             if "squeeze_excitation" in self.search_space.node_features.__dict__.keys():
                 if node_features[feature_index("squeeze_excitation", self.search_space)] == 1:
                     # Global average pooling
@@ -382,6 +384,15 @@ class ArcGraph(ig.Graph):
                     FLOPs += 2*(out_channels//16)*out_channels
                     # Second activation function
                     FLOPs += out_channels
+
+            if "aggregation" in self.search_space.node_features.__dict__.keys() and node_features[feature_index("aggregation", self.search_space)] != "sum":
+                raise NotImplementedError(f"Aggregation type {node_features[feature_index('aggregation', self.search_space)]} not implemented, only 'sum' is supported for now")
+            else:
+                predecessors = self.predecessors(node.index)
+                if len(predecessors) > 1:
+                    input_elements = input_channels * (input_breadth**2)
+                    agg_flops = (len(predecessors) - 1) * input_elements
+                    FLOPs += agg_flops
             node['FLOPs'] = FLOPs
 
         self.params_and_FLOPs_added = True
@@ -638,7 +649,7 @@ class ArcGraph(ig.Graph):
                     blueprint.vs[adapter_idx]["input_shape"] = list(pred_shape)
                     blueprint.vs[adapter_idx]["output_shape"] = [pred_shape[0], min_spatial]
                     blueprint.vs[adapter_idx]["reduc_factor"] = reduction_factor
-                    # NOTE: I think it should be blueprint.vs[adapter_idx]["FLOPs"] = (reduction_factor**2 -1)*((pred_shape[1]// reduction_factor)**2)*pred_shape[0] but changed to be consistent with deepspeed
+                    # NOTE: I think it should be (reduction_factor**2 -1)*((pred_shape[1]// reduction_factor)**2)*pred_shape[0] (count comparisons) but changed to be consistent with deepspeed
                     blueprint.vs[adapter_idx]["FLOPs"] = (reduction_factor**2)*((pred_shape[1]// reduction_factor)**2)*pred_shape[0]
                     
                     # Add edge from predecessor to maxpool adapter
@@ -748,7 +759,10 @@ class ArcGraph(ig.Graph):
         input_shape = blueprint.vs[gap_idx]["input_shape"]
         blueprint.vs[gap_idx]["output_shape"] = [input_shape[0], 1]
         gap_input_shape = blueprint.vs[gap_idx]["input_shape"]
-        blueprint.vs[gap_idx]["FLOPs"] = gap_input_shape[0]*gap_input_shape[1]**2
+        gap_FLOPs = gap_input_shape[0]*gap_input_shape[1]**2
+        if len(blueprint.predecessors(gap_idx)) > 1:
+            gap_FLOPs += (len(blueprint.predecessors(gap_idx)) - 1)*gap_input_shape[0]*(gap_input_shape[1]**2)
+        blueprint.vs[gap_idx]["FLOPs"] = gap_FLOPs
         
         # Add linear classifier layer
         blueprint.add_vertex()
@@ -780,27 +794,10 @@ class ArcGraph(ig.Graph):
         
         blueprint = self.to_blueprint(input_shape=input_shape, num_classes=num_classes)
         
-        class CustomSE(nn.Module):
-            def __init__(self, channels, reduction=16):
-                super(CustomSE, self).__init__()
-                self.avg_pool = nn.AdaptiveAvgPool2d(1)
-                self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1)
-                self.relu = nn.ReLU(inplace=True)
-                self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1)
-                self.sigmoid = nn.Sigmoid()
-                
-            def forward(self, x):
-                module_input = x
-                x = self.avg_pool(x)
-                x = self.fc1(x)
-                x = self.relu(x)
-                x = self.fc2(x)
-                x = self.sigmoid(x)
-                return module_input * x
-        
         class ArcGraphModel(nn.Module):
             def __init__(self, blueprint):
                 super(ArcGraphModel, self).__init__()
+                from custom_layers import CustomSE, ChannelPad, AggTensors
                 self.layers = nn.ModuleDict()
                 self.topology = []
                 
@@ -833,9 +830,16 @@ class ArcGraph(ig.Graph):
                         stride = features[feature_index('stride', blueprint.search_space)]
                         groups = features[feature_index('groups', blueprint.search_space)]
                         if groups == -1:
-                            groups = in_channels
-                        se = features[feature_index('squeeze_excitation', blueprint.search_space)]
-                        aggregation = features[feature_index('aggregation', blueprint.search_space)]
+                            groups = in_channels                            
+
+                        if len(blueprint.predecessors(node_idx)) > 1:
+                            if 'aggregation' in blueprint.search_space.node_features.__dict__.keys():
+                                    aggregation = features[feature_index('aggregation', blueprint.search_space)]
+                                    agg = AggTensors(aggregation)
+                                    self.layers[f'agg_{node_idx}'] = agg
+                            else:
+                                agg = AggTensors('sum')
+                                self.layers[f'agg_{node_idx}'] = agg
                         
                         conv = nn.Conv2d(
                             in_channels=in_channels,
@@ -853,8 +857,10 @@ class ArcGraph(ig.Graph):
                         self.layers[f'conv_{node_idx}'] = conv
                         self.layers[f'bn_{node_idx}'] = batchnorm
                         self.layers[f'act_{node_idx}'] = activation
-                        if se == 1:
-                            self.layers[f'se_{node_idx}'] = CustomSE(out_channels)
+                        if 'squeeze_excitation' in blueprint.search_space.node_features.__dict__.keys():
+                            se = features[feature_index('squeeze_excitation', blueprint.search_space)]
+                            if se == 1:
+                                self.layers[f'se_{node_idx}'] = CustomSE(out_channels)
                     
                     elif node_type == 'breadth_adapter':
                         reduc_factor = node['reduc_factor']
@@ -863,32 +869,11 @@ class ArcGraph(ig.Graph):
                     elif node_type == 'channel_adapter':
                         in_channels, _ = node['input_shape']
                         out_channels, _ = node['output_shape']
-                        padding = node['padding']
-                        
-                        class ChannelPad(nn.Module):
-                            def __init__(self, in_channels, out_channels):
-                                super(ChannelPad, self).__init__()
-                                self.in_channels = in_channels
-                                self.out_channels = out_channels
-                                
-                                if in_channels > 0:
-                                    spacing = out_channels / in_channels
-                                    self.indices = [int(i * spacing) for i in range(in_channels)]
-                                else:
-                                    self.indices = []
-                            
-                            def forward(self, x):
-                                b, c, h, w = x.size()
-                                result = torch.zeros(b, self.out_channels, h, w, device=x.device)
-                                
-                                for i, idx in enumerate(self.indices):
-                                    result[:, idx] = x[:, i]
-                                
-                                return result
-                        
                         self.layers[f'chpad_{node_idx}'] = ChannelPad(in_channels, out_channels)
                     
                     elif node_type == 'global_avg_pool':
+                        if len(blueprint.predecessors(node_idx)) > 1:
+                            self.layers[f'agg_{node_idx}'] = AggTensors('sum')
                         self.layers[f'gap_{node_idx}'] = nn.AdaptiveAvgPool2d(1)
                     
                     elif node_type == 'classifier':
@@ -925,26 +910,10 @@ class ArcGraph(ig.Graph):
                         else:
                             pred_outputs = [outputs[pred_idx] for pred_idx in predecessors]
                             
-                            if node_type == 'original':
-                                features = blueprint.vs[node_idx]['features']
-                                aggregation = features[feature_index('aggregation', blueprint.search_space)]
-                                
-                                if aggregation == "sum":
-                                    x = torch.stack(pred_outputs).sum(dim=0)
-                                elif aggregation == "gate":
-                                    weights = []
-                                    for po in pred_outputs:
-                                        w = torch.mean(po, dim=(2, 3), keepdim=True)
-                                        weights.append(w)
-                                    
-                                    weights = torch.stack(weights, dim=0)
-                                    weights = torch.softmax(weights, dim=0)
-                                    
-                                    x = sum(w * po for w, po in zip(weights, pred_outputs))
-                                else:
-                                    x = torch.stack(pred_outputs).sum(dim=0)
+                            if node_type == 'original' or node_type == 'global_avg_pool':
+                                x = self.layers[f'agg_{node_idx}'](torch.stack(pred_outputs))
                             else:
-                                x = torch.stack(pred_outputs).sum(dim=0)
+                                raise ValueError(f'{node_type} nodes may not have >1 predecessors, received {len(predecessors)}')
                         
                         if node_type == 'original':
                             x = self.layers[f'conv_{node_idx}'](x)
@@ -975,6 +944,7 @@ class ArcGraph(ig.Graph):
         return model
     
 
+# TODO: count flops related to aggregations, and check if deepseed can detect them
 X = np.array([[32, 3, 2, 1, 0, "sum"], [64, 3, 2, -1, 0, "sum"], [128, 3, 1, 1, 0, "sum"]], dtype = "object")
 A = np.array([[0, 1, 1], [0, 0, 1], [0, 0, 0]])
 # X = np.array([[32, 3, 2, 1, 0, "sum"]], dtype = "object")
@@ -991,19 +961,23 @@ g2=g.to_blueprint(input_shape=[3, 32])
 model = g.to_torch(input_shape=[3, 32])
 
 from torchsummary import summary
-from deepspeed.profiling.flops_profiler import get_model_profile
+from model_profiling import profile_model
 
 summary(model, input_size=(3, 32, 32))
-profile = get_model_profile(model, input_shape=(1, 3, 32, 32), print_profile = True, as_string = False, detailed=True)
-print(f' n_params(deepspeed): {profile[2]}')
-print(f' FLOPs (deepspeed): {profile[0]}')
-print('')
-print(f' n_params: {g2.n_params}')
+model.eval()
+params, flops = profile_model(model, input_shape=(1, 3, 32, 32))
+print(f' n_params(custom deepspeed): {params}')
+print(f' FLOPs (custom deepspeed): {flops} \n')
+
+print(f' n_params (blueprint): {g2.n_params}')
 print(f' FLOPs (blueprint): {g2.FLOPs} \n')
+
+# print(f' n_params (seed): {g.n_params}')
+# print(f' FLOPs (seed): {g.FLOPs} \n')
 
 # print([g2.vs[i]['FLOPs'] for i in range(g2.vcount())])
 # # Compute the output for a random input
-# random_input = torch.randn(1, 3, 32, 32)
-# output = model(random_input)
+random_input = torch.randn(1, 3, 32, 32)
+output = model(random_input)
 
 g2.plot(display=True)
