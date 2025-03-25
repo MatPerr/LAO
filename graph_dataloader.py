@@ -60,10 +60,9 @@ class DataGenerator():
             g.add_latent_shapes(self.input_shape)
             g.add_n_params_and_FlOPs()
             v = g.to_V()
-            n_params = g.count_params()
-            FLOPs = g.count_FLOPs()
             V.append(v)
-            Y.append(torch.Tensor([n_params, FLOPs]))
+            g2 = g.to_blueprint(input_shape=self.input_shape)
+            Y.append(torch.Tensor([g2.n_params, g2.FLOPs, g2.BBGP]))
             pbar.set_description(f"Sampling valid graphs...")
 
         V = torch.stack(V)
@@ -72,6 +71,7 @@ class DataGenerator():
         path = os.path.join(declare_dir_path(os.path.join(self.exp_dir, "graph_data")), f"{n_samples}_samples_{current_datetime}.pt")
         torch.save({'V': V,'Y': Y}, path)
     
+
 class _RepeatSampler(object):
     def __init__(self, sampler):
         self.sampler = sampler
@@ -175,5 +175,5 @@ def get_dataloaders(V, Y, train_split=0.99, batch_size=32, num_workers=0):
 
 # from search_space import *
 
-# datagen = DataGenerator(SearchSpace(), input_shape = [32, 3], exp_dir="exp1903")
+# datagen = DataGenerator(SearchSpace(), input_shape = [3, 32], exp_dir="exp2403")
 # datagen.generate_dataset(1_000_000)

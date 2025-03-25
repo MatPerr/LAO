@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal
 
 @dataclass
 class NodeFeatures:
@@ -7,8 +7,8 @@ class NodeFeatures:
     kernel_size: List[int] = field(default_factory=lambda: [1, 3, 5])
     stride: List[int] = field(default_factory=lambda: [1, 2])
     groups: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, -1])
-    squeeze_excitation: List[int] = field(default_factory=lambda: [0, 1])
-    aggregation: List = field(default_factory=lambda: ["sum", "gate"])
+    # squeeze_excitation: List[int] = field(default_factory=lambda: [0, 1])
+    # aggregation: List = field(default_factory=lambda: ["sum", "gate"])
 
 
 @dataclass
@@ -16,6 +16,7 @@ class GraphFeatures:
     n_nodes: List[int] = field(default_factory=lambda: [20])
     max_preds: int = 2
     traceable: bool = True
+    node_encoding_type: Literal["categorical", "quantized"] = "quantized"
 
 
 @dataclass

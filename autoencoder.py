@@ -12,17 +12,17 @@ import os
 from datetime import datetime
 from tqdm import tqdm
 import math
-
+import numpy as np
 
 def get_device():
-        if torch.backends.mps.is_available():
-            return "mps"
-        
-        elif torch.cuda.is_available():
-            return f"cuda:0"
-        
-        else: 
-            return "cpu"
+    if torch.backends.mps.is_available():
+        return "mps"
+    
+    elif torch.cuda.is_available():
+        return f"cuda:0"
+    
+    else: 
+        return "cpu"
 
 
 class NonNegativeLinear(nn.Linear):
@@ -89,7 +89,7 @@ class ICNN(nn.Module):
         return y
     
 
-def SMMD_RBF_gaussian_prior(z, scale=1/8, adaptive=True):
+def MMD_RBF_gaussian_prior(z, scale=1/8, adaptive=True, unbiased=True, standardized=True):
     batch_size = z.size(0)
     z_dim = z.size(1)
     norms2 = torch.sum(z ** 2, dim=1, keepdim=True)
@@ -103,23 +103,89 @@ def SMMD_RBF_gaussian_prior(z, scale=1/8, adaptive=True):
     else:
         gamma2 = scale * z_dim
 
-    variance = (
-        (gamma2 / (2. + gamma2)) ** z_dim +
-        (gamma2 / (4. + gamma2)) ** (z_dim / 2.) -
-        2. * (gamma2 ** 2. / ((1. + gamma2) * (3. + gamma2))) ** (z_dim / 2.)
-    )
-
-    variance = 2. * variance / (batch_size * (batch_size - 1.))
-    variance_normalization = (variance) ** (-1. / 2.)
-    Ekzz = (torch.sum(torch.exp(-dists2 / (2. * gamma2))) - batch_size) / (batch_size * batch_size - batch_size)
+    Eknn = (gamma2 / (2. + gamma2)) ** (z_dim / 2.)
     Ekzn = (
         (gamma2 / (1. + gamma2)) ** (z_dim / 2.) *
         torch.mean(torch.exp(-norms2 / (2. * (1. + gamma2))))
     )
-    Eknn = (gamma2 / (2. + gamma2)) ** (z_dim / 2.)
+    if unbiased:
+        Ekzz = (torch.sum(torch.exp(-dists2 / (2. * gamma2))) - batch_size) / (batch_size * batch_size - batch_size)
+    else:
+        Ekzz = torch.sum(torch.exp(-dists2 / (2. * gamma2))) / (batch_size * batch_size)
     
-    return torch.clamp(variance_normalization * (Ekzz - 2. * Ekzn + Eknn), min=0.0)
+    MMD = Eknn - 2. * Ekzn + Ekzz
 
+    if standardized:
+        variance = (
+        (gamma2 / (2. + gamma2)) ** z_dim +
+        (gamma2 / (4. + gamma2)) ** (z_dim / 2.) -
+        2. * (gamma2 ** 2. / ((1. + gamma2) * (3. + gamma2))) ** (z_dim / 2.)
+        )
+
+        variance = 2. * variance / (batch_size * (batch_size - 1.))
+        variance_normalization = (variance) ** (-1. / 2.)
+    
+        # return torch.clamp(, min=0.0)
+        return variance_normalization * MMD
+    else:
+        return MMD
+
+
+class CodeNorm1d(nn.Module):
+    """
+    A custom normalization layer for 1D input that performs only the normalization
+    part of BatchNorm1d without the learnable affine parameters.
+    """
+    def __init__(self, eps=1e-5, momentum=0.1, track_running_stats=True):
+        super(CodeNorm1d, self).__init__()
+        self.eps = eps
+        self.momentum = momentum
+        self.track_running_stats = track_running_stats
+        
+        if self.track_running_stats:
+            self.register_buffer('running_mean', torch.tensor(0.0))
+            self.register_buffer('running_var', torch.tensor(1.0))
+            self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
+        else:
+            self.register_parameter('running_mean', None)
+            self.register_parameter('running_var', None)
+            self.register_parameter('num_batches_tracked', None)
+            
+    def forward(self, input):
+        # Ensure we're handling a 2D input (N, L)
+        if input.dim() != 2:
+            raise ValueError(f'Expected 2D input (N, L), got {input.dim()}D input')
+            
+        # Determine if we should use batch stats or running stats
+        if self.training or not self.track_running_stats:
+            # Compute batch statistics across all dimensions except the batch dimension
+            batch_mean = input.mean()
+            batch_var = input.var(unbiased=False)
+            
+            if self.track_running_stats:
+                # Update running statistics
+                with torch.no_grad():
+                    self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * batch_mean
+                    self.running_var = (1 - self.momentum) * self.running_var + self.momentum * batch_var
+                    self.num_batches_tracked += 1
+                    
+            # Use batch statistics for normalization
+            mean = batch_mean
+            var = batch_var
+        else:
+            # Use running statistics for normalization
+            mean = self.running_mean
+            var = self.running_var
+            
+        # Perform normalization (without affine transformation)
+        # x_norm = (x - E[x]) / sqrt(Var[x] + eps)
+        input_normalized = (input - mean) / torch.sqrt(var + self.eps)
+            
+        return input_normalized
+        
+    def extra_repr(self):
+        return f'eps={self.eps}, momentum={self.momentum}, ' \
+               f'track_running_stats={self.track_running_stats}'
 
 class CosineAnnealingAlphaLR(_LRScheduler):
     def __init__(self, optimizer, T_max, alpha, last_epoch=-1):
@@ -154,6 +220,45 @@ class ResidualBlock(nn.Module):
         return out
     
 
+def batch_quantized_decode(quantized_values_batch, possible_values):
+    """
+    Decode a batch of quantized values to their closest feature values using PyTorch.
+    
+    Arguments:
+        quantized_values_batch: tensor of shape (batch_size*n_nodes, n_features) with quantized values
+        possible_values: List of possible values for each feature
+    
+    Returns:
+        tensor with decoded feature values
+    """
+    import torch
+    
+    # Convert possible_values to tensor if it's not already
+    if not isinstance(possible_values, torch.Tensor):
+        possible_values = torch.tensor(possible_values, device=quantized_values_batch.device)
+    
+    n_bins = len(possible_values)
+    if n_bins == 1:
+        return torch.full_like(quantized_values_batch, possible_values[0])
+    
+    # Calculate bin width
+    bin_width = 1.0 / n_bins
+    
+    # Clip values to [0, 1] range
+    clipped_values = torch.clamp(quantized_values_batch, 0, 1)
+    
+    # Find bin indices for each value
+    bin_indices = torch.min(
+        torch.floor(clipped_values / bin_width).long(),
+        torch.tensor(n_bins - 1, device=quantized_values_batch.device)
+    )
+    
+    # Convert bin indices to feature values by indexing into possible_values
+    decoded_values = possible_values[bin_indices]
+    
+    return decoded_values
+
+
 class ArcAE(nn.Module):
     def __init__(self,
                  search_space,
@@ -165,15 +270,27 @@ class ArcAE(nn.Module):
         self.search_space = search_space
         self.ae_type = ae_type
         self.z_dim = z_dim
+        self.bounds = torch.zeros(2, z_dim)
+        self.bounds[0, :] = float('inf')
+        self.bounds[1, :] = float('-inf')
+        self.node_encoding_type = search_space.graph_features.node_encoding_type
 
         self.n_nodes = search_space.graph_features.n_nodes[0]
         self.nA = (self.n_nodes*(self.n_nodes - 1))//2
-        self.nX = 0
-        self.feature_widths = []
-        for feature_values in search_space.node_features.__dict__.values():
-            w = len(feature_values)
-            self.nX += w*self.n_nodes
-            self.feature_widths.append(w)
+        
+        # Calculate input size based on encoding type
+        if self.node_encoding_type == "categorical":
+            self.nX = 0
+            self.feature_widths = []
+            for feature_values in search_space.node_features.__dict__.values():
+                w = len(feature_values)
+                self.nX += w*self.n_nodes
+                self.feature_widths.append(w)
+        elif self.node_encoding_type == "quantized":
+            # For quantized encoding, each feature uses just one value
+            self.nX = len(search_space.node_features.__dict__) * self.n_nodes
+            self.feature_widths = None  # Not needed for quantized encoding
+        
         self.input_size = self.nA + self.nX
         
         # Encoder 
@@ -193,6 +310,8 @@ class ArcAE(nn.Module):
         self.fc_mu = nn.Linear(encoder_hs[-1], z_dim)
         if ae_type == 'VAE':
             self.fc_logvar = nn.Linear(encoder_hs[-1], z_dim)
+        if ae_type == 'WAE':
+            self.cn = CodeNorm1d(z_dim)
 
         # Decoder
         decoder_layers = []
@@ -213,6 +332,7 @@ class ArcAE(nn.Module):
         # Predictors
         self.params_predictor = ICNN(z_dim, [512]*2)
         self.FLOPs_predictor = ICNN(z_dim, [512]*2)
+        self.BBGP_predictor = ICNN(z_dim, [512]*2)
         
     def encode(self, v):
         v = self.encoder_base(v)
@@ -220,6 +340,8 @@ class ArcAE(nn.Module):
         logvar = None
         if self.ae_type == 'VAE':
             logvar = self.fc_logvar(v)
+        if self.ae_type == 'WAE':
+            mu = self.cn(mu)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -236,19 +358,30 @@ class ArcAE(nn.Module):
     def decode(self, z):
         batch_size = z.shape[0]
         h = self.decoder_base(z)
+        
+        # Split into node features and adjacency components
         v_X, v_A = torch.split(h, [self.nX, self.nA], dim=1)
-        v_A = (nn.Sigmoid()(v_A) > 0.5)*1.0
-        v_X_parts = torch.split(v_X.view(batch_size, self.n_nodes, -1), self.feature_widths, dim=2)
-        v_X_processed = []
-        for part in v_X_parts:
-            part_softmax = nn.functional.softmax(part, dim=2)
-            _, indices = torch.max(part_softmax, dim=2, keepdim=True)
-            part_one_hot = torch.zeros_like(part_softmax)
-            part_one_hot.scatter_(2, indices, 1.0)
-            v_X_processed.append(part_one_hot)
+        
+        # Process adjacency matrix (same for both encoding types)
+        v_A = (nn.Sigmoid()(v_A) > 0.5) * 1.0
+        
+        if self.node_encoding_type == "categorical":
+            # Process categorical node features (existing logic)
+            v_X_parts = torch.split(v_X.view(batch_size, self.n_nodes, -1), self.feature_widths, dim=2)
+            v_X_processed = []
+            for part in v_X_parts:
+                part_softmax = nn.functional.softmax(part, dim=2)
+                _, indices = torch.max(part_softmax, dim=2, keepdim=True)
+                part_one_hot = torch.zeros_like(part_softmax)
+                part_one_hot.scatter_(2, indices, 1.0)
+                v_X_processed.append(part_one_hot)
 
-        v_X = torch.cat(v_X_processed, dim=2)
-
+            v_X = torch.cat(v_X_processed, dim=2)
+        elif self.node_encoding_type == "quantized":
+            # For quantized encoding, just reshape to appropriate dimensions
+            # No processing needed during training, values are interpreted at graph creation time
+            v_X = v_X.view(batch_size, self.n_nodes, -1)
+        
         return torch.cat([v_X.view(batch_size, -1), v_A], dim=1)
 
     def forward(self, v):
@@ -258,12 +391,24 @@ class ArcAE(nn.Module):
 
         return v_hat
     
+    def _update_bounds(self, z):
+        with torch.no_grad():
+            if self.bounds.device != z.device:
+                self.bounds = self.bounds.to(z.device)
+            
+            batch_min = torch.min(z, dim=0)[0]
+            self.bounds[0, :] = torch.minimum(self.bounds[0, :], batch_min)
+            
+            batch_max = torch.max(z, dim=0)[0]
+            self.bounds[1, :] = torch.maximum(self.bounds[1, :], batch_max)
+    
     def loss(self, v, y):
         batch_size = v.shape[0]
 
         # Encode and decode input
         mu, logvar = self.encode(v)
         z = self.reparameterize(mu, logvar)
+        self._update_bounds(z)
         h = self.decoder_base(z)
 
         # Split node and edge parts
@@ -279,26 +424,52 @@ class ArcAE(nn.Module):
         adj_correct = torch.all(v_A_hat_binary == v_A, dim=1)
         edge_acc = adj_correct.float().mean()
         
-        # Split node part per feature
-        v_X_hat_parts = torch.split(v_X_hat.view(batch_size, self.n_nodes, -1), self.feature_widths, dim=2)
-        v_X_parts = torch.split(v_X.view(batch_size, self.n_nodes, -1), self.feature_widths, dim=2)
-        
-        # Node loss
-        node_loss = 0
-        all_features_correct = torch.ones(batch_size, dtype=torch.bool, device=v.device)
-        for part, target_part in zip(v_X_hat_parts, v_X_parts):
-            target_indices = torch.argmax(target_part, dim=2)
-            node_loss += nn.CrossEntropyLoss()(part.reshape(-1, part.size(2)), target_indices.reshape(-1))
+        # Different handling based on encoding type
+        if self.node_encoding_type == "categorical":
+            # Split node part per feature
+            v_X_hat_parts = torch.split(v_X_hat.view(batch_size, self.n_nodes, -1), self.feature_widths, dim=2)
+            v_X_parts = torch.split(v_X.view(batch_size, self.n_nodes, -1), self.feature_widths, dim=2)
             
-            predicted_indices = torch.argmax(part, dim=2)
-            nodes_correct_for_feature = torch.all(predicted_indices == target_indices, dim=1)
-            all_features_correct &= nodes_correct_for_feature
+            # Node loss
+            node_loss = 0
+            all_features_correct = torch.ones(batch_size, dtype=torch.bool, device=v.device)
+            for part, target_part in zip(v_X_hat_parts, v_X_parts):
+                target_indices = torch.argmax(target_part, dim=2)
+                node_loss += nn.CrossEntropyLoss()(part.reshape(-1, part.size(2)), target_indices.reshape(-1))
+                
+                predicted_indices = torch.argmax(part, dim=2)
+                nodes_correct_for_feature = torch.all(predicted_indices == target_indices, dim=1)
+                all_features_correct &= nodes_correct_for_feature
+        elif self.node_encoding_type == "quantized":
+            node_loss = torch.sqrt(self.n_nodes*nn.MSELoss()(v_X_hat, v_X)) # Empirically works better to multiply by the number of nodes
+            
+            feature_count = len(self.search_space.node_features.__dict__)
+            v_X_hat_reshaped = v_X_hat.reshape(batch_size, self.n_nodes, feature_count)
+            v_X_reshaped = v_X.reshape(batch_size, self.n_nodes, feature_count)            
+            all_match = torch.ones(batch_size, dtype=torch.bool, device=v.device)
+            
+            for j, feature_name in enumerate(self.search_space.node_features.__dict__):
+                feature_values = getattr(self.search_space.node_features, feature_name)
+                
+                # Get feature values for all samples and nodes
+                pred_feature = v_X_hat_reshaped[:, :, j].reshape(-1, 1)
+                true_feature = v_X_reshaped[:, :, j].reshape(-1, 1)
+                
+                # Decode in batch
+                pred_decoded = batch_quantized_decode(pred_feature, feature_values).reshape(batch_size, self.n_nodes)
+                true_decoded = batch_quantized_decode(true_feature, feature_values).reshape(batch_size, self.n_nodes)
+                
+                # Check if all nodes match for this feature across all samples
+                feature_match = torch.all(pred_decoded == true_decoded, dim=1)
+                all_match = all_match & feature_match
+            
+            all_features_correct = all_match
         
         # Node acc
         node_acc = all_features_correct.float().mean()
         
         # Recon loss
-        recon_loss = node_loss + len(self.feature_widths)*edge_loss # Multypling by the number of node features empirically works better
+        recon_loss = node_loss + edge_loss
 
         # Recon acc
         perfect_reconstructions = adj_correct & all_features_correct
@@ -307,16 +478,18 @@ class ArcAE(nn.Module):
         # Predictor-related losses
         pred_params = self.params_predictor(z)
         pred_FLOPs = self.FLOPs_predictor(z)
+        pred_BBGP = self.BBGP_predictor(z)
         params_loss = nn.MSELoss()(pred_params, torch.log(y[:, 0]))
         FLOPs_loss = nn.MSELoss()(pred_FLOPs, torch.log(y[:, 1]))
-        pred_loss = params_loss + FLOPs_loss
+        BBGP_loss = nn.MSELoss()(pred_BBGP, torch.log2(y[:, 2]))
+        pred_loss = params_loss + FLOPs_loss + BBGP_loss
 
         # Regularization
         if self.ae_type == 'VAE':
             reg = (0.5 * (mu**2 + logvar.exp() - 1 - logvar)).sum(1).mean()
             reg_name = 'KL'
         elif self.ae_type == 'WAE':
-            reg = SMMD_RBF_gaussian_prior(z)
+            reg = MMD_RBF_gaussian_prior(z, adaptive=False)
             reg_name = 'MMD'
         elif self.ae_type == 'AE':
             reg = torch.maximum(torch.abs(z)-3.0, torch.zeros_like(z)).pow(2).sum(1).mean()
@@ -324,14 +497,15 @@ class ArcAE(nn.Module):
             reg_name = 'L2'
 
         # Total loss
-        loss = recon_loss
+        total_loss = 0
+        total_loss += recon_loss
         if self.beta > 0:
-            loss += self.beta*reg
+            total_loss += self.beta*reg
         if self.gamma > 0:
-            loss += self.gamma*pred_loss
+            total_loss += self.gamma*pred_loss
 
         return {
-            'loss': loss, 
+            'loss': total_loss, 
             'recon': recon_loss, 
             reg_name: reg, 
             'pred': pred_loss,
@@ -341,7 +515,8 @@ class ArcAE(nn.Module):
             'node_acc': node_acc,
             'edge_acc': edge_acc,
             'params_loss': params_loss, 
-            'FLOPs_loss': FLOPs_loss
+            'FLOPs_loss': FLOPs_loss,
+            'BBGP_loss': BBGP_loss
         }
 
     def log_latent_space(self, train_dl, writer, global_step, device, num_samples=10_000):
@@ -370,9 +545,207 @@ class ArcAE(nn.Module):
         
         self.train()  # Switch back to training mode
         return all_z
+    
+
+    def viz_decoded_prior(self, writer, global_step, device, num_samples=10_000):
+        """
+        Sample random vectors from the latent space, decode them into graphs,
+        and visualize the distribution of node features and adjacency matrix.
+        """
+        import numpy as np
+        import matplotlib.pyplot as plt
+        import torch
+        import io
+        from PIL import Image
+        from torchvision.transforms import ToTensor
+        
+        self.eval()  # Set model to evaluation mode
+        n_nodes = self.search_space.graph_features.n_nodes[0]
+        feature_names = list(self.search_space.node_features.__dict__.keys())
+        feature_values = list(self.search_space.node_features.__dict__.values())
+        
+        # Generate random normal vectors
+        with torch.no_grad():
+            z_samples = torch.randn(num_samples, self.z_dim, device=device)
+            decoded_vectors = self.decode(z_samples)
+            
+            # Split into node features and adjacency
+            batch_size = decoded_vectors.shape[0]
+            decoded_X, decoded_A = torch.split(decoded_vectors, [self.nX, self.nA], dim=1)
+            decoded_A = decoded_A.cpu().numpy()
+            
+            # Process decoded features based on encoding type
+            if self.node_encoding_type == "categorical":
+                # Split decoded features by feature type
+                decoded_X_parts = torch.split(decoded_X.view(batch_size, n_nodes, -1), self.feature_widths, dim=2)
+                
+                # Convert to numpy for analysis
+                decoded_X_parts = [part.cpu().numpy() for part in decoded_X_parts]
+                
+                # For each node and feature, find the most probable value
+                decoded_features = np.empty((batch_size, n_nodes, len(feature_names)), dtype='object')
+                for j, (feature_part, possible_values) in enumerate(zip(decoded_X_parts, feature_values)):
+                    # Get the most probable index for each sample and node
+                    predicted_indices = np.argmax(feature_part, axis=2)
+                    # Map to actual feature values
+                    for b in range(batch_size):
+                        for i in range(n_nodes):
+                            idx = predicted_indices[b, i]
+                            decoded_features[b, i, j] = possible_values[idx]
+            
+            elif self.node_encoding_type == "quantized":
+                # Reshape to (batch_size, n_nodes, n_features)
+                decoded_X = decoded_X.view(batch_size, n_nodes, -1)
+                
+                # Prepare array for decoded features (using NumPy for visualization)
+                decoded_features = np.empty((batch_size, n_nodes, len(feature_names)), dtype='object')
+                
+                # Batch decode each feature
+                for j, possible_values in enumerate(feature_values):
+                    # Flatten for batch processing (all samples, all nodes)
+                    feature_flat = decoded_X[:, :, j].reshape(-1, 1)
+                    
+                    # Batch decode using PyTorch version
+                    decoded_flat = batch_quantized_decode(feature_flat, possible_values)
+                    
+                    # Convert to numpy for visualization and reshape
+                    decoded_flat_np = decoded_flat.cpu().numpy().flatten()
+                    
+                    # Reshape back and store
+                    decoded_features[:, :, j] = decoded_flat_np.reshape(batch_size, n_nodes)
+        
+        # Create a grid of histograms for each node and feature
+        fig_width = 5 * len(feature_names)
+        fig_height = 4 * n_nodes
+        fig, axes = plt.subplots(n_nodes, len(feature_names), figsize=(fig_width, fig_height))
+        
+        # Adjust spacing
+        plt.subplots_adjust(hspace=0.4, wspace=0.3)
+        
+        # If there's only one node, make sure axes is 2D
+        if n_nodes == 1:
+            axes = np.array([axes])
+        
+        # If there's only one feature, make sure axes is 2D
+        if len(feature_names) == 1:
+            axes = axes.reshape(-1, 1)
+        
+        # For each node and feature, create a histogram
+        for i in range(n_nodes):
+            for j, (feature_name, feature_vals) in enumerate(zip(feature_names, feature_values)):
+                ax = axes[i, j]
+                
+                # Get all decoded values for this node and feature across samples
+                feature_values_for_node = decoded_features[:, i, j]
+                
+                # Count occurrences of each value
+                unique_vals, counts = np.unique(feature_values_for_node, return_counts=True)
+                
+                # Prepare data for bar chart with all possible values
+                plot_counts = np.zeros(len(feature_vals))
+                for val_idx, val in enumerate(feature_vals):
+                    matching_idx = np.where(unique_vals == val)[0]
+                    if len(matching_idx) > 0:
+                        plot_counts[val_idx] = counts[matching_idx[0]]
+                
+                # Normalize to get probabilities
+                probs = plot_counts / np.sum(plot_counts) if np.sum(plot_counts) > 0 else plot_counts
+                
+                # Create bar plot with aligned x-ticks to feature values
+                bars = ax.bar(range(len(feature_vals)), probs)
+                
+                # Annotate x-axis with actual feature values
+                ax.set_xticks(range(len(feature_vals)))
+                
+                # Format x-tick labels based on feature type
+                if isinstance(feature_vals[0], int) or isinstance(feature_vals[0], float):
+                    ax.set_xticklabels(feature_vals)
+                else:  # For string values like "sum", "gate"
+                    ax.set_xticklabels([str(val) for val in feature_vals])
+                
+                # Add value annotations on top of bars
+                for bar_idx, bar in enumerate(bars):
+                    height = bar.get_height()
+                    if height > 0.01:  # Only annotate bars with significant probability
+                        ax.text(
+                            bar.get_x() + bar.get_width()/2.,
+                            height + 0.01,
+                            f'{height:.2f}',
+                            ha='center', 
+                            va='bottom', 
+                            fontsize=8,
+                            rotation=45 if len(feature_vals) > 8 else 0
+                        )
+                
+                # Set title and labels
+                alias = self.search_space.aliases.get(feature_name, feature_name)
+                ax.set_title(f'Node {i}: {alias}')
+                ax.set_ylabel('Probability')
+                
+                # Rotate x-tick labels if there are many values
+                if len(feature_vals) > 4:
+                    plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
+        
+        # Set overall title
+        fig.suptitle(f'Distribution of Decoded Node Features (Step {global_step})', fontsize=16)
+        
+        # Save figure to tensorboard
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        
+        # Convert to tensor and log to tensorboard
+        image = ToTensor()(Image.open(buf))
+        writer.add_image('decoded_features_distribution', image, global_step)
+        
+        # Close figure to free memory
+        plt.close(fig)
+        
+        # Also create a visualization of the adjacency matrix distribution
+        plt.figure(figsize=(10, 8))
+        
+        # Calculate average adjacency matrix
+        avg_adj = np.mean(decoded_A, axis=0)
+        
+        # Reshape to square matrix for visualization
+        adj_idx = 0
+        avg_adj_matrix = np.zeros((n_nodes, n_nodes))
+        for i in range(n_nodes):
+            for j in range(i + 1, n_nodes):
+                avg_adj_matrix[i, j] = avg_adj[adj_idx]
+                adj_idx += 1
+        
+        # Create heatmap
+        plt.imshow(avg_adj_matrix, cmap='Blues', vmin=0, vmax=1)
+        plt.colorbar(label='Average Connection Probability')
+        plt.title(f'Average Adjacency Matrix from Latent Samples (Step {global_step})')
+        plt.xlabel('Node Index')
+        plt.ylabel('Node Index')
+        
+        # Add text annotations for probabilities
+        for i in range(n_nodes):
+            for j in range(n_nodes):
+                if avg_adj_matrix[i, j] > 0:
+                    plt.text(j, i, f'{avg_adj_matrix[i, j]:.2f}',
+                            ha='center', va='center', color='black' if avg_adj_matrix[i, j] < 0.5 else 'white')
+        
+        # Save adjacency matrix figure to tensorboard
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        
+        # Convert to tensor and log to tensorboard
+        image = ToTensor()(Image.open(buf))
+        writer.add_image('decoded_adjacency_distribution', image, global_step)
+        
+        # Close figure to free memory
+        plt.close()
+        
+        self.train()  # Switch back to training mode
+        return
 
 
-    def train_loop(self, train_dl, val_dl, iterations, lr=1e-3, log_dir="runs/arc_ae", beta=1e-2, gamma=1e-3,
+    def train_loop(self, train_dl, val_dl, iterations, lr=5e-4, log_dir="runs/arc_ae", beta=1e-2, gamma=1e-3,
         save_dir="checkpoints", save_every=50_000,
         val_every=15_000, log_latent_every=15_000):
 
@@ -422,6 +795,7 @@ class ArcAE(nn.Module):
                 if (global_step + 1) % log_latent_every == 0:
                     tqdm.write(f"Logging latent space distributions at step {global_step+1}")
                     self.log_latent_space(train_dl, writer, global_step, device)
+                    self.viz_decoded_prior(writer, global_step, device)
                 
                 # Validation
                 if (global_step + 1) % val_every == 0:
@@ -488,6 +862,7 @@ class ArcAE(nn.Module):
         # Log latent space distributions for final model
         tqdm.write("Logging latent space distributions for final model")
         self.log_latent_space(train_dl, writer, global_step, device)
+        self.viz_decoded_prior(writer, global_step, device)
         
         # Save final model
         final_checkpoint_path = os.path.join(save_dir, "arcae_final.pt")
@@ -505,10 +880,12 @@ class ArcAE(nn.Module):
         return val_losses
     
 
-data = torch.load("exp1903/graph_data/1000000_samples_0319_1028.pt")
-train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=512, num_workers=0)
+# data = torch.load("exp1903/graph_data/1000000_samples_0319_1028.pt")
+# data = torch.load("exp2303/graph_data/1000000_samples_0323_0144.pt")
+data = torch.load("exp2403/graph_data/1000000_samples_0325_0013.pt")
+train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
 
 from search_space import *
 
-ae_model = ArcAE(search_space = SearchSpace(), z_dim = 139, ae_type = "AE",)
-ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, log_dir="runs/arc_ae", save_dir="checkpoints")
+ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
+ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")

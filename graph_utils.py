@@ -10,6 +10,7 @@ import tempfile
 
 from search_space import *
 
+
 def one_hot_encode(value, possible_values):
     try:
         index = possible_values.index(value)
@@ -20,8 +21,60 @@ def one_hot_encode(value, possible_values):
     
     return one_hot
 
+
+def quantized_encode(value, possible_values):
+    try:
+        index = possible_values.index(value)
+    except ValueError:
+        raise ValueError(f"Value {value} not found in possible values: {possible_values}")
+    
+    n_bins = len(possible_values)
+    if n_bins == 1:
+        return np.array([0.5], dtype=float)
+    bin_width = 1.0 / n_bins
+    
+    # Calculate bin center (middle point of the bin)
+    # For example, with 4 bins, bin centers would be at 0.125, 0.375, 0.625, 0.875
+    bin_center = (index + 0.5) * bin_width
+    
+    return np.array([bin_center], dtype=float)
+
+
+def quantized_decode(quantized_value, possible_values):
+    """
+    Decode a quantized value back to the closest value in possible_values.
+    Handles values outside the [0,1] range.
+    
+    Arguments:
+        quantized_value: A float value (can be outside the [0, 1] range)
+        possible_values: List of all possible values for this feature
+    
+    Returns:
+        The decoded feature value from possible_values
+    """
+    n_bins = len(possible_values)
+    if n_bins == 1:
+        return possible_values[0]  # Special case for single value
+    
+    # Handle values outside [0,1]
+    if quantized_value <= 0:
+        return possible_values[0]
+    if quantized_value >= 1:
+        return possible_values[-1]
+    
+    # Calculate bin width and the bin centers
+    bin_width = 1.0 / n_bins
+    bin_centers = [(i + 0.5) * bin_width for i in range(n_bins)]
+    
+    # Find the closest bin center
+    closest_bin = min(range(n_bins), key=lambda i: abs(bin_centers[i] - quantized_value))
+    
+    return possible_values[closest_bin]
+
+
 def feature_index(feature_name, search_space):
     return list(search_space.node_features.__dict__.keys()).index(feature_name)
+
 
 def format_number_spaces(number):
     number_string = str(number)
@@ -69,15 +122,26 @@ class ArcGraph(ig.Graph):
                     index += 1
 
             # Process node features
-            X_onehot = V[:-n_adj_comp].reshape(n_nodes, -1)
-            X = np.empty((n_nodes, len(search_space.node_features.__dict__)), dtype = 'object')
-            for i in range(n_nodes):
-                shift = 0
-                for j, possible_values in enumerate(search_space.node_features.__dict__.values()):
-                    onehot_val = X_onehot[i, shift:shift + len(possible_values)]
-                    X[i, j] = possible_values[np.argmax(onehot_val)]
-                    shift += len(possible_values)
-                self.vs[i]["features"] = X[i].tolist()
+            node_encoding_type = search_space.graph_features.node_encoding_type
+            if node_encoding_type == "categorical":
+                X_onehot = V[:-n_adj_comp].reshape(n_nodes, -1)
+                X = np.empty((n_nodes, len(search_space.node_features.__dict__)), dtype = 'object')
+                for i in range(n_nodes):
+                    shift = 0
+                    for j, possible_values in enumerate(search_space.node_features.__dict__.values()):
+                        onehot_val = X_onehot[i, shift:shift + len(possible_values)]
+                        X[i, j] = possible_values[np.argmax(onehot_val)]
+                        shift += len(possible_values)
+                    self.vs[i]["features"] = X[i].tolist()
+            elif node_encoding_type == "quantized":
+                feature_count = len(search_space.node_features.__dict__)
+                X_quantized = V[:-n_adj_comp].reshape(n_nodes, feature_count)
+                X = np.empty((n_nodes, feature_count), dtype='object')
+                for i in range(n_nodes):
+                    for j, possible_values in enumerate(search_space.node_features.__dict__.values()):
+                        quantized_val = X_quantized[i, j]
+                        X[i, j] = quantized_decode(quantized_val, possible_values)
+                    self.vs[i]["features"] = X[i].tolist()
     
 
     def plot(self, output_path=None, backbone=True, display=False):
@@ -295,10 +359,14 @@ class ArcGraph(ig.Graph):
         assert self.search_space is not None, "search_space must be provided to convert a graph to graphvector"
         n_nodes = self.vcount()
         V = []
+        node_encoding_type = self.search_space.graph_features.node_encoding_type
         for i in range(n_nodes):
             for j, possible_values in enumerate(self.search_space.node_features.__dict__.values()):
                 val = self.vs[i]["features"][j]
-                V += one_hot_encode(val, possible_values).tolist()
+                if node_encoding_type == "categorical":
+                    V += one_hot_encode(val, possible_values).tolist()
+                elif node_encoding_type == "quantized":
+                    V += quantized_encode(val, possible_values).tolist()
 
         for i in range(n_nodes):
             for j in range(i + 1, n_nodes):
@@ -332,7 +400,6 @@ class ArcGraph(ig.Graph):
         node_features = self.vs[0]["features"]
         stride = node_features[feature_index("stride", self.search_space)]
         out_channels = node_features[feature_index("out_channels", self.search_space)]
-        input_channels = input_shape[0]
         input_breadth = input_shape[1]
         self.vs[0]["output_shape"] = [out_channels, input_breadth // stride]
 
@@ -340,70 +407,124 @@ class ArcGraph(ig.Graph):
             self.vs[i]["input_shape"] = self._get_input_shape(i)
             self.vs[i]["output_shape"] = self._get_output_shape(i)
 
-        self.shapes_added = True     
+        # BBGP is the Breadth Before Global (average) Pooling
+        self.BBGP = self.vs[-1]["output_shape"][1]
+        self.shapes_added = True
 
     def add_n_params_and_FlOPs(self):
+        """Calculate and add parameters and FLOPs for each node in the graph."""
         assert self.search_space is not None, "search_space must be provided to count node params"
         assert self.valid, "the graph must be valid to count node params"
         assert self.shapes_added, "the latent shapes must be added to count node params"
-        for node in self.vs:
-            input_channels, input_breadth = node['input_shape']
-            node_features = node["features"]
-            out_channels = node_features[feature_index("out_channels", self.search_space)]
-            kernel_size = node_features[feature_index("kernel_size", self.search_space)]
-            stride = node_features[feature_index("stride", self.search_space)]
-            groups = node_features[feature_index("groups", self.search_space)]
-            if groups == -1:
-                groups = input_channels
-            # Both n_params and FLOPs estimation assume padding = 'same'
-            # n_params
-            conv_params = out_channels*((kernel_size**2)*(input_channels // groups) + 1)
-            bn_params = 2*out_channels
-            n_params = conv_params + bn_params
-            if "squeeze_excitation" in self.search_space.node_features.__dict__.keys():
-                if node_features[feature_index("squeeze_excitation", self.search_space)] == 1:
-                    n_params += (out_channels//16)*(out_channels + 1) + (out_channels)*(out_channels//16 + 1)
-            node['n_params'] = n_params
-            
-            # FLOPs
-            conv_FLOPs = (2*(input_breadth**2)*(kernel_size**2)*input_channels*out_channels) // ((stride**2)*groups)
-            # NOTE: 4* during training and 2* during inference, averaged to 3*
-            bn_FLOPs = 3*out_channels*(input_breadth // stride)**2
-            act_flops = out_channels*(input_breadth // stride)**2
-            FLOPs = conv_FLOPs + bn_FLOPs + act_flops
-
-            if "squeeze_excitation" in self.search_space.node_features.__dict__.keys():
-                if node_features[feature_index("squeeze_excitation", self.search_space)] == 1:
-                    # Global average pooling
-                    FLOPs += out_channels*(input_breadth // stride)**2
-                    # First conv
-                    FLOPs += 2*out_channels*(out_channels//16)
-                    # First activation function
-                    FLOPs += out_channels//16
-                    # Second conv
-                    FLOPs += 2*(out_channels//16)*out_channels
-                    # Second activation function
-                    FLOPs += out_channels
-
-            if "aggregation" in self.search_space.node_features.__dict__.keys() and node_features[feature_index("aggregation", self.search_space)] != "sum":
-                raise NotImplementedError(f"Aggregation type {node_features[feature_index('aggregation', self.search_space)]} not implemented, only 'sum' is supported for now")
-            else:
-                predecessors = self.predecessors(node.index)
-                if len(predecessors) > 1:
-                    input_elements = input_channels * (input_breadth**2)
-                    agg_flops = (len(predecessors) - 1) * input_elements
-                    FLOPs += agg_flops
-            node['FLOPs'] = FLOPs
-
+        
+        for i in range(self.vcount()):
+            self._add_node_n_params_and_FLOPs(i)
+        
         self.params_and_FLOPs_added = True
-        self.n_params = self.count_params()
-        self.FLOPs = self.count_FLOPs()
+        self.n_params = self._count_params()
+        self.FLOPs = self._count_FLOPs()
+
+    def _add_node_n_params_and_FLOPs(self, node_idx):
+        """Calculate and add parameters and FLOPs for a single node."""
+        node = self.vs[node_idx]
+        input_channels, input_breadth = node['input_shape']
+        node_features = node["features"]
+        out_channels = node_features[feature_index("out_channels", self.search_space)]
+        kernel_size = node_features[feature_index("kernel_size", self.search_space)]
+        stride = node_features[feature_index("stride", self.search_space)]
+        groups = node_features[feature_index("groups", self.search_space)]
+        
+        if groups == -1:
+            groups = input_channels
+        
+        node['n_params'] = self._calculate_node_params(
+            node_features, input_channels, out_channels, kernel_size, groups
+        )
+        
+        node['FLOPs'] = self._calculate_node_FLOPs(
+            node, node_features, input_channels, input_breadth, out_channels, 
+            kernel_size, stride, groups
+        )
+
+    def _calculate_node_params(self, node_features, input_channels, out_channels, kernel_size, groups):
+        conv_params = out_channels * ((kernel_size**2) * (input_channels // groups) + 1)
+        bn_params = 2 * out_channels
+        n_params = conv_params + bn_params
+        
+        if "squeeze_excitation" in self.search_space.node_features.__dict__.keys():
+            if node_features[feature_index("squeeze_excitation", self.search_space)] == 1:
+                se_reduce = out_channels // 16
+                # First FC: (out_channels//16) * (out_channels + bias)
+                # Second FC: out_channels * (out_channels//16 + bias)
+                n_params += se_reduce * (out_channels + 1) + out_channels * (se_reduce + 1)
+        
+        return n_params
+
+    def _calculate_node_FLOPs(self, node, node_features, input_channels, input_breadth, 
+                            out_channels, kernel_size, stride, groups):
+        output_breadth = input_breadth // stride
+        conv_FLOPs = (2 * (input_breadth**2) * (kernel_size**2) * input_channels * out_channels) // ((stride**2) * groups)     
+        bn_FLOPs = 2 * out_channels * output_breadth**2
+        # ReLU FlOPs
+        act_flops = 2 * out_channels * output_breadth**2
+        FLOPs = conv_FLOPs + bn_FLOPs + act_flops   
+        if "squeeze_excitation" in self.search_space.node_features.__dict__.keys():
+            if node_features[feature_index("squeeze_excitation", self.search_space)] == 1:
+                FLOPs += self._calculate_se_FLOPs(out_channels, output_breadth)
+        
+        FLOPs += self._calculate_aggregation_FLOPs(node, input_channels, input_breadth)
+        
+        return FLOPs
+
+    def _calculate_se_FLOPs(self, out_channels, output_breadth):
+        se_reduce = out_channels // 16
+        FLOPs = 0
+        
+        # Global average pooling
+        FLOPs += out_channels * output_breadth**2
+        
+        # First FC
+        FLOPs += 2 * out_channels * se_reduce
+        
+        # ReLU
+        FLOPs += 2 * se_reduce
+        
+        # Second FC
+        # NOTE: "+ out_channels" is a quickfix to be consistent with deepspeed
+        FLOPs += 2 * se_reduce * out_channels + out_channels
+        
+        # Sigmoid: 1 FLOP for negation, 1 for exponentiation, 1 for addition, 1 for division
+        FLOPs += 4 * out_channels
+        
+        # Pointwise multiplication
+        FLOPs += out_channels * output_breadth**2
+        
+        return FLOPs
+
+    def _calculate_aggregation_FLOPs(self, node, input_channels, input_breadth):
+        if "aggregation" in self.search_space.node_features.__dict__.keys():
+            agg_type = node["features"][feature_index("aggregation", self.search_space)]
+            if agg_type != "sum":
+                raise NotImplementedError(
+                    f"Aggregation type {agg_type} not implemented, only 'sum' is supported for now"
+                )
+        
+        # Calculate aggregation FLOPs for nodes with multiple predecessors
+        predecessors = self.predecessors(node.index)
+        if len(predecessors) > 1:
+            input_elements = input_channels * (input_breadth**2)
+            # (n-1) additions for n inputs
+            agg_flops = (len(predecessors) - 1) * input_elements
+            return agg_flops
+        
+        else:
+            return 0
     
-    def count_params(self):
+    def _count_params(self):
         assert self.params_and_FLOPs_added, "n_params must be added to count total params"
         return np.sum([node['n_params'] for node in self.vs if node['n_params'] is not None])
     
-    def count_FLOPs(self):
+    def _count_FLOPs(self):
         assert self.params_and_FLOPs_added, "FLOPs must be added to count total FLOPs"
         return np.sum([node['FLOPs'] for node in self.vs if node['FLOPs'] is not None])
         
@@ -604,13 +725,12 @@ class ArcGraph(ig.Graph):
         # Process nodes in topological order
         adapter_count = 0
         blueprint.vs[node_mapping[0]]["input_shape"] = input_shape
-        self._make_node_valid(blueprint, node_mapping[0], input_shape)
-        
-        # Calculate output shape for the first node
+        self._make_node_valid(blueprint, node_mapping[0], input_shape)        
         node_features = blueprint.vs[node_mapping[0]]["features"]
         stride = node_features[feature_index("stride", self.search_space)]
         out_channels = node_features[feature_index("out_channels", self.search_space)]
         blueprint.vs[node_mapping[0]]["output_shape"] = [out_channels, input_shape[1] // stride]
+        blueprint._add_node_n_params_and_FLOPs(node_mapping[0])
         
         # Process remaining nodes
         for i in range(1, self.vcount()):
@@ -694,6 +814,7 @@ class ArcGraph(ig.Graph):
             stride = node_features[feature_index("stride", self.search_space)]
             out_channels = node_features[feature_index("out_channels", self.search_space)]
             blueprint.vs[node_mapping[i]]["output_shape"] = [out_channels, input_shape[1] // stride]
+            blueprint._add_node_n_params_and_FLOPs(node_mapping[i])
         
         # Add global average pooling layer
         # First, find all nodes with outdegree 0 (sink nodes)
@@ -757,6 +878,7 @@ class ArcGraph(ig.Graph):
         
         # Set GAP output shape - reduces spatial dimensions to 1
         input_shape = blueprint.vs[gap_idx]["input_shape"]
+        blueprint.BBGP = input_shape[1]
         blueprint.vs[gap_idx]["output_shape"] = [input_shape[0], 1]
         gap_input_shape = blueprint.vs[gap_idx]["input_shape"]
         gap_FLOPs = gap_input_shape[0]*gap_input_shape[1]**2
@@ -782,8 +904,8 @@ class ArcGraph(ig.Graph):
         blueprint.valid = True
         blueprint.shapes_added = True
         blueprint.params_and_FLOPs_added = True
-        blueprint.n_params = blueprint.count_params()
-        blueprint.FLOPs = blueprint.count_FLOPs()
+        blueprint.n_params = blueprint._count_params()
+        blueprint.FLOPs = blueprint._count_FLOPs()
 
         return blueprint
 
@@ -944,40 +1066,38 @@ class ArcGraph(ig.Graph):
         return model
     
 
-# TODO: count flops related to aggregations, and check if deepseed can detect them
-X = np.array([[32, 3, 2, 1, 0, "sum"], [64, 3, 2, -1, 0, "sum"], [128, 3, 1, 1, 0, "sum"]], dtype = "object")
-A = np.array([[0, 1, 1], [0, 0, 1], [0, 0, 0]])
-# X = np.array([[32, 3, 2, 1, 0, "sum"]], dtype = "object")
-# A = np.array([[0]])
-g = ArcGraph(X=X, A=A)
-g.search_space = SearchSpace()
-g.is_valid(input_shape = [3, 32], verbose = True)
-g.add_latent_shapes([3, 32])
-g.add_n_params_and_FlOPs()
 
-g2=g.to_blueprint(input_shape=[3, 32])
-# g.plot(display=True)
 
-model = g.to_torch(input_shape=[3, 32])
 
-from torchsummary import summary
-from model_profiling import profile_model
+# X = np.array([[32, 3, 2, 1], [64, 3, 2, -1], [128, 3, 2, 1]], dtype = "object")
+# A = np.array([[0, 1, 1], [0, 0, 1], [0, 0, 0]])
 
-summary(model, input_size=(3, 32, 32))
-model.eval()
-params, flops = profile_model(model, input_shape=(1, 3, 32, 32))
-print(f' n_params(custom deepspeed): {params}')
-print(f' FLOPs (custom deepspeed): {flops} \n')
+# g = ArcGraph(X=X, A=A)
+# g.search_space = SearchSpace()
+# g.is_valid(input_shape = [3, 32], verbose = True)
+# g.add_latent_shapes([3, 32])
+# g.add_n_params_and_FlOPs()
+# v = g.to_V()
 
-print(f' n_params (blueprint): {g2.n_params}')
-print(f' FLOPs (blueprint): {g2.FLOPs} \n')
+# g2=g.to_blueprint(input_shape=[3, 32])
 
-# print(f' n_params (seed): {g.n_params}')
-# print(f' FLOPs (seed): {g.FLOPs} \n')
+# g2.plot(display=True)
 
-# print([g2.vs[i]['FLOPs'] for i in range(g2.vcount())])
+# model = g.to_torch(input_shape=[3, 32])
+
+# from torchsummary import summary
+# from model_profiling import profile_model
+
+# summary(model, input_size=(3, 32, 32))
+# model.eval()
+# params, flops = profile_model(model, input_shape=(1, 3, 32, 32))
+# print(f' n_params(profiler): {params}')
+# print(f' FLOPs (profiler): {flops} \n')
+
+# print(f' n_params (blueprint): {g2.n_params}')
+# print(f' FLOPs (blueprint): {g2.FLOPs} \n')
+
+
 # # Compute the output for a random input
-random_input = torch.randn(1, 3, 32, 32)
-output = model(random_input)
-
-g2.plot(display=True)
+# random_input = torch.randn(1, 3, 32, 32)
+# output = model(random_input)

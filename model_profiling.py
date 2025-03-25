@@ -71,7 +71,7 @@ def count_aggtensors_flops_from_topology(model, input_shape=(1, 3, 32, 32)):
                                     # print(f"Could not find predecessor shapes for node {node_idx}")
                                     continue
                                 
-                                # Use the first predecessor shape as reference (all predecessors are mde to have the same size before summation)
+                                # Use the first predecessor shape as reference (all predecessors are made to have the same size before summation)
                                 if pred_shapes:
                                     # Calculate elements in the tensor
                                     shape = pred_shapes[0]
@@ -94,6 +94,91 @@ def count_aggtensors_flops_from_topology(model, input_shape=(1, 3, 32, 32)):
     return agg_flops
 
 
+def count_sigmoid_and_se_flops(model, input_shape=(1, 3, 32, 32)):
+    """
+    Count FLOPs for Sigmoid operations (4 FLOPs per element) and CustomSE modules.
+    """
+    sigmoid_flops = 0
+    se_multiplication_flops = 0
+    
+    # Keep track of sigmoid modules within CustomSE to avoid double counting
+    customse_sigmoid_modules = set()
+    
+    # First identify all sigmoid modules that are part of CustomSE
+    for name, module in model.named_modules():
+        if "CustomSE" in module.__class__.__name__:
+            # Find the sigmoid submodule within CustomSE
+            for subname, submodule in module.named_modules():
+                if isinstance(submodule, torch.nn.Sigmoid):
+                    # Store the full path to this sigmoid module
+                    if subname:
+                        full_path = f"{name}.{subname}"
+                    else:
+                        full_path = f"{name}.sigmoid"  # If it's the direct .sigmoid attribute
+                    customse_sigmoid_modules.add(full_path)
+    
+    # Run a forward pass to collect tensor shapes
+    dummy_input = torch.zeros(*input_shape)
+    sigmoid_outputs = {}
+    se_inputs = {}
+    
+    # Create hooks to capture outputs from sigmoid and inputs to CustomSE
+    sigmoid_handles = []
+    se_handles = []
+    
+    def capture_sigmoid_output_hook(name):
+        def hook(module, input, output):
+            sigmoid_outputs[name] = output
+        return hook
+    
+    def capture_se_input_hook(name):
+        def hook(module, input, output):
+            se_inputs[name] = input[0]  # input is a tuple, so we take the first element
+        return hook
+    
+    # Register hooks for capturing tensor shapes
+    for name, module in model.named_modules():
+        # Only hook standalone sigmoids (not part of CustomSE)
+        if isinstance(module, torch.nn.Sigmoid) and name not in customse_sigmoid_modules:
+            sigmoid_handles.append(module.register_forward_hook(capture_sigmoid_output_hook(name)))
+        if "CustomSE" in module.__class__.__name__:
+            se_handles.append(module.register_forward_hook(capture_se_input_hook(name)))
+            # Also specifically hook the sigmoid within CustomSE to get its output shape
+            if hasattr(module, 'sigmoid'):
+                sigmoid_handles.append(module.sigmoid.register_forward_hook(
+                    capture_sigmoid_output_hook(f"{name}.sigmoid")))
+    
+    # Run the forward pass
+    with torch.no_grad():
+        model(dummy_input)
+    
+    # Remove hooks
+    for handle in sigmoid_handles:
+        handle.remove()
+    for handle in se_handles:
+        handle.remove()
+    
+    # Count standalone sigmoid FLOPs (4 FLOPs per element)
+    for name, output in sigmoid_outputs.items():
+        num_elements = output.numel()
+        module_flops = 4 * num_elements  # 4 FLOPs per element for sigmoid
+        sigmoid_flops += module_flops
+        # print(f"Sigmoid {name} processes {num_elements} elements, estimated {module_flops} FLOPs")
+    
+    # Count CustomSE element-wise multiplication FLOPs
+    for name, module in model.named_modules():
+        if "CustomSE" in module.__class__.__name__:
+            if name in se_inputs:
+                input_tensor = se_inputs[name]
+                num_elements = input_tensor.numel()
+                # One multiplication per element for module_input * x
+                module_flops = num_elements
+                se_multiplication_flops += module_flops
+                # print(f"CustomSE {name} multiplication: {num_elements} elements, estimated {module_flops} FLOPs")
+    
+    return sigmoid_flops, se_multiplication_flops
+
+
 def profile_model(model, input_shape=(1, 3, 32, 32)):
     # Step 1: Get baseline FLOPs from DeepSpeed
     try:
@@ -108,4 +193,16 @@ def profile_model(model, input_shape=(1, 3, 32, 32)):
     # Step 2: Count AggTensors FLOPs using the topology
     agg_flops = count_aggtensors_flops_from_topology(model, input_shape)
     
-    return params, flops + agg_flops
+    # Step 3: Count Sigmoid and CustomSE FLOPs
+    sigmoid_flops, se_multiplication_flops = count_sigmoid_and_se_flops(model, input_shape)
+    
+    # Detailed breakdown
+    detailed_flops = {
+        'deepspeed_flops': flops,
+        'aggtensors_flops': agg_flops,
+        'sigmoid_flops': sigmoid_flops,
+        'se_multiplication_flops': se_multiplication_flops,
+        'total_flops': flops + agg_flops + sigmoid_flops + se_multiplication_flops
+    }
+    
+    return params, detailed_flops['total_flops']
