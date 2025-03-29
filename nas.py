@@ -7,7 +7,6 @@ from tqdm import tqdm
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 
-# BoTorch imports
 import botorch
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
@@ -20,12 +19,10 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.constraints import Interval
 from gpytorch.kernels import ScaleKernel, MaternKernel
 
-# Import relevant modules
 from graph_utils import ArcGraph
 from search_space import SearchSpace
 from autoencoder import ArcAE, get_device, CosineAnnealingAlphaLR
 
-# For CIFAR datasets
 import torchvision
 import torchvision.transforms as transforms
 import torch.nn as nn
@@ -437,10 +434,8 @@ class LSBO_problem:
         return next_z, acq_value.item()
         
     def run(self, iterations=100, n_initial=10):
-        # Initialize with random samples
         self._initialize_gp(n_initial)
         
-        # Find current best
         if self.maximize:
             best_idx = torch.argmax(self.Y)
         else:
@@ -451,18 +446,12 @@ class LSBO_problem:
         
         print(f"Starting optimization from best initial cost: {best_cost:.4f}")
         
-        # Run optimization iterations
         for i in range(1, iterations+1):
             start_time = time.time()
             print(f"\n--- Iteration {i}/{iterations} ---")
             
-            # Find next point to evaluate
             next_z, acq_value = self._optimize_acquisition(iteration = i)
-            
-            # Evaluate next architecture
             cost = self._evaluate_architecture(next_z, model_idx=n_initial+i)
-            
-            # Convert cost to tensor
             cost_tensor = torch.tensor([[cost]], device=self.device)
             
             # Store observation
@@ -484,7 +473,6 @@ class LSBO_problem:
             elapsed_time = time.time() - start_time
             print(f"Iteration {i}/{iterations} | Cost={cost:.4f} | Iteration time={elapsed_time:.2f}s")
 
-            # Log to TensorBoard
             self.writer.add_scalar("GP/mean", self.gp.mean_module.constant.item(), n_initial + i)
             self.writer.add_scalar("GP/output_scale", self.gp.covar_module.outputscale.item(), n_initial + i)
             lengthscale = self.gp.covar_module.base_kernel.lengthscale
@@ -506,10 +494,8 @@ class LSBO_problem:
             f.write(f"Best {'accuracy' if self.maximize else 'cost'}: {best_cost:.4f}\n")
             f.write(f"Latent vector: {best_z.cpu().numpy()}\n")
         
-        # Save the latent vector
         torch.save(best_z, os.path.join(self.save_dir, "best_z.pt"))
         
-        # Final log
         self.writer.close()
         
         return best_z, best_cost
@@ -578,9 +564,7 @@ def find_argmin(model, input_shape=(2,), lr=0.01, n_steps=2_000, device="cpu"):
     return x.detach(), loss
 
 
-# Example usage
 if __name__ == "__main__":
-    # Load a trained autoencoder
     # device = get_device()
     device = "cpu"
     search_space = SearchSpace()
@@ -593,8 +577,7 @@ if __name__ == "__main__":
     ae.to(device)
     
 
-
-    # # Predictor based stuff
+    # # Descend gradient of predictor's input
     # predictor = ae.FLOPs_predictor
     # z, FLOPs = find_argmin(predictor, input_shape=(99,), lr=0.1, n_steps=2_000, device="cpu")
     # with torch.no_grad():
@@ -612,7 +595,6 @@ if __name__ == "__main__":
     # print(FLOPs)
 
 
-    # Bo based stuff
     # Create LSBO problem
     lsbo = LSBO_problem(
         trained_ae=ae,
