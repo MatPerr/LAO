@@ -273,8 +273,8 @@ class ArcAE(nn.Module):
         self.bounds = torch.zeros(2, z_dim)
         self.bounds[0, :] = float('inf')
         self.bounds[1, :] = float('-inf')
-        self.node_encoding_type = search_space.graph_features.node_encoding_type
 
+        self.node_encoding_type = search_space.graph_features.node_encoding_type
         self.n_nodes = search_space.graph_features.n_nodes[0]
         self.nA = (self.n_nodes*(self.n_nodes - 1))//2
         
@@ -882,10 +882,10 @@ class ArcAE(nn.Module):
 
 # data = torch.load("exp1903/graph_data/1000000_samples_0319_1028.pt")
 # data = torch.load("exp2303/graph_data/1000000_samples_0323_0144.pt")
-data = torch.load("exp2403/graph_data/1000000_samples_0325_0013.pt")
-train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
+# data = torch.load("exp2403/graph_data/1000000_samples_0325_0013.pt")
+# train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
 
-from search_space import *
+# from search_space import *
 
-ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
-ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")
+# ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
+# ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")

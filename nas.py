@@ -11,8 +11,10 @@ from torch.utils.tensorboard import SummaryWriter
 import botorch
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
-from botorch.acquisition import LogExpectedImprovement, UpperConfidenceBound
+from botorch.acquisition import AnalyticAcquisitionFunction, LogExpectedImprovement, ExpectedImprovement
+from botorch.acquisition.objective import PosteriorTransform
 from botorch.optim import optimize_acqf
+from botorch.models.model import Model
 from botorch.utils.transforms import standardize, normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.constraints import Interval
@@ -30,6 +32,83 @@ import torch.nn as nn
 import torch.optim as optim
 
 
+class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
+    """
+    logPiEI(x) = log([EI*π](x)) = log(EI(x)) + log(π(x)), 
+    where π is a provided weighting scheme (preference function)
+    """
+    _log: bool = True
+    def __init__(
+        self, 
+        model: Model, 
+        best_f: float | torch.Tensor,
+        posterior_transform: PosteriorTransform | None = None,
+        pi_func: torch.nn.Module = None,
+        beta: float = 1.0,
+        n: int = 1,
+        maximize: bool = True, 
+    ):
+        super().__init__(model=model, posterior_transform=posterior_transform)
+        self.register_buffer("best_f", torch.as_tensor(best_f))
+        self.maximize = maximize
+
+        self.beta = beta
+        self.n = n
+        
+        self.log_ei = LogExpectedImprovement(
+            model=model, 
+            best_f=best_f, 
+            maximize=maximize
+        )
+        
+        self.pi_func = pi_func or (lambda x: torch.ones_like(x))
+
+    def forward(self, X: torch.Tensor):
+        log_ei_values = self.log_ei(X)
+        pi_values = self.pi_func(X).squeeze()
+        log_pi_values = torch.log(torch.clamp(pi_values, min=1e-10))
+
+        return log_ei_values + (self.beta/self.n)*log_pi_values
+        
+
+class PiExpectedImprovement(AnalyticAcquisitionFunction):
+    """
+    PiEI(x) = EI(x)*π(x), 
+    where π is a provided weighting scheme (preference function)
+    """
+    _log: bool = True
+    def __init__(
+        self, 
+        model: Model, 
+        best_f: float | torch.Tensor,
+        posterior_transform: PosteriorTransform | None = None,
+        pi_func: torch.nn.Module = None,
+        beta: float = 1.0,
+        n: int = 1,
+        maximize: bool = True, 
+    ):
+        super().__init__(model=model, posterior_transform=posterior_transform)
+        self.register_buffer("best_f", torch.as_tensor(best_f))
+        self.maximize = maximize
+
+        self.beta = beta
+        self.n = n
+        
+        self.ei = ExpectedImprovement(
+            model=model, 
+            best_f=best_f, 
+            maximize=maximize
+        )
+        
+        self.pi_func = pi_func or (lambda x: torch.ones_like(x))
+
+    def forward(self, X: torch.Tensor):
+        ei_values = self.ei(X)
+        pi_values = self.pi_func(X).squeeze()
+
+        return ei_values * (pi_values ** (self.beta/self.n))
+            
+
 class LSBO_problem:
     def __init__(self, trained_ae, cost_function="accuracy", dataset="cifar10", input_shape=[3, 32], 
                  num_classes=None, custom_cost_fn=None, log_dir="runs/nas", acquisition_type="logEI"):
@@ -43,8 +122,8 @@ class LSBO_problem:
         self.acquisition_type = acquisition_type
         # self.device = get_device()
         self.device = "cpu"
+        self.z_dim = self.ae.z_dim
         
-        # Set number of classes based on dataset if not provided
         if num_classes is None:
             if dataset == "cifar10":
                 self.num_classes = 10
@@ -59,32 +138,24 @@ class LSBO_problem:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.writer = SummaryWriter(os.path.join(log_dir, f"{cost_function}_{timestamp}"))
         
-        self.z_dim = self.ae.z_dim
-        
         # Create a directory for saving models
         self.save_dir = f"nas_models/{cost_function}_{timestamp}"
         os.makedirs(self.save_dir, exist_ok=True)
         
-        # Initialize storage for observations
-        self.X = torch.empty(0, self.z_dim, device=self.device)  # Latent vectors
-        self.Y = torch.empty(0, 1, device=self.device)  # Observed costs
-        
-        # Flag for maximization (accuracy) or minimization (params, FLOPs)
+        self.X = torch.empty(0, self.z_dim, device=self.device)
+        self.Y = torch.empty(0, 1, device=self.device)
+
         self.maximize = (cost_function == "accuracy")
         
-        # Bounds for the latent space
-        # Use the autoencoder's learned bounds if available
         if hasattr(self.ae, 'bounds') and self.ae.bounds is not None:
             self.bounds = self.ae.bounds.to(self.device)
+            print(self.bounds)
         else:
-            # Default bounds if not available
-            self.bounds = torch.tensor([[-4.0] * self.z_dim, [4.0] * self.z_dim], device=self.device)
+            self.bounds = torch.tensor([[-5.0] * self.z_dim, [5.0] * self.z_dim], device=self.device)
         
-        # Search space for the architecture
         self.search_space = self.ae.search_space
             
     def _prepare_dataset(self):
-        # Define image transformations
         if self.dataset == "cifar10" or self.dataset == "cifar100":
             train_transform = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
@@ -100,7 +171,6 @@ class LSBO_problem:
         else:
             raise ValueError(f"Unsupported dataset: {self.dataset}")
         
-        # Create dataset
         if self.dataset == "cifar10":
             train_dataset = torchvision.datasets.CIFAR10(
                 root='./data', train=True, download=True, transform=train_transform)
@@ -112,7 +182,6 @@ class LSBO_problem:
             test_dataset = torchvision.datasets.CIFAR100(
                 root='./data', train=False, download=True, transform=test_transform)
         
-        # Create data loaders
         train_loader = torch.utils.data.DataLoader(
             train_dataset, batch_size=128, shuffle=True, num_workers=4, pin_memory=True)
         test_loader = torch.utils.data.DataLoader(
@@ -131,7 +200,7 @@ class LSBO_problem:
         train_iter = iter(train_loader)
         iteration = 0
         
-        pbar = tqdm(total=max_iterations, desc="Training Progress")        
+        pbar = tqdm(total=max_iterations, desc="Training...")        
         while iteration < max_iterations:
             model.train()            
             try:
@@ -155,20 +224,19 @@ class LSBO_problem:
             pbar.set_description(f" iter {iteration + 1} | loss {loss.item():.2e} | acc {batch_acc:.2f} | lr {optimizer.param_groups[0]['lr']:.2e}")
             pbar.update(1)
 
-            self.writer.add_scalar('Loss/train_batch', loss.item(), iteration)
-            self.writer.add_scalar('Accuracy/train_batch', batch_acc, iteration)
-            self.writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], iteration)
+            self.writer.add_scalar('Inner_loop/train/loss', loss.item(), iteration)
+            self.writer.add_scalar('Inner_loop/train/accuracy', batch_acc, iteration)
+            self.writer.add_scalar('Inner_loop/train/LR', optimizer.param_groups[0]['lr'], iteration)
             
             if (iteration + 1) % val_interval == 0 or iteration == max_iterations - 1:
                 val_acc, val_loss = self._validate_model(model, test_loader, criterion)
                 
-                self.writer.add_scalar('Loss/val', val_loss, iteration)
-                self.writer.add_scalar('Accuracy/val', val_acc, iteration)
+                self.writer.add_scalar('Inner_loop/val/loss', val_loss, iteration)
+                self.writer.add_scalar('Inner_loop/val/accuracy', val_acc, iteration)
                 
                 if val_acc > best_acc:
                     best_acc = val_acc
 
-            
             iteration += 1
         
         pbar.close()
@@ -176,16 +244,6 @@ class LSBO_problem:
         return best_acc / 100.0  # Return as a fraction
     
     def _evaluate_architecture(self, z, model_idx=None):
-        """
-        Evaluate an architecture encoded by latent vector z.
-        
-        Args:
-            z: Latent vector encoding the architecture
-            model_idx: Optional index for model labeling
-            
-        Returns:
-            cost: The cost value (to be minimized or maximized)
-        """
         # Decode the latent vector to a graph vector
         with torch.no_grad():
             graph_vector = self.ae.decode(z.unsqueeze(0))
@@ -204,7 +262,7 @@ class LSBO_problem:
             # blueprint.plot(display=True)
             n_params = blueprint.n_params
             cost = np.log(n_params)
-            print(f"Architecture has {n_params:,} parameters, log(params): {cost:.4f}")
+            print(f"n_params: {n_params:,} | log(n_params): {cost:.4f}")
             
             # Log the architecture visualization
             if model_idx is not None:
@@ -218,7 +276,7 @@ class LSBO_problem:
             blueprint = graph.to_blueprint(input_shape=self.input_shape, num_classes=self.num_classes)
             flops = blueprint.FLOPs
             cost = np.log(flops)
-            print(f"Architecture has {flops:,} FLOPs, log(FLOPs): {cost:.4f}")
+            print(f"FLOPs: {flops:,} | log(FLOPs): {cost:.4f}")
             
             # Log the architecture visualization
             if model_idx is not None:
@@ -232,7 +290,7 @@ class LSBO_problem:
             try:
                 model = graph.to_torch(input_shape=self.input_shape, num_classes=self.num_classes)
                 accuracy = self._train_model(model)
-                print(f"Architecture achieved {accuracy*100:.2f}% accuracy")
+                print(f"Accuracy: {accuracy*100:.2f}%")
                 
                 # Save the model and log the architecture visualization
                 if model_idx is not None:
@@ -255,22 +313,15 @@ class LSBO_problem:
             raise ValueError(f"Unsupported cost function: {self.cost_function}")
 
     def _initialize_gp(self, n_initial=10):
-        """
-        Initialize the Gaussian Process with random samples.
-        
-        Args:
-            n_initial: Number of initial random samples
-        """
         print(f"Initializing with {n_initial} random architecture samples...")
         
-        for i in range(n_initial):
+        for i in range(1, n_initial+1):
+            start_time = time.time()
             # Sample random latent vector within bounds
             z = torch.randn(self.z_dim, device=self.device)
             
             # Evaluate architecture
-            start_time = time.time()
             cost = self._evaluate_architecture(z, model_idx=i)
-            end_time = time.time()
             
             # Convert cost to tensor
             cost_tensor = torch.tensor([[cost]], device=self.device)
@@ -280,18 +331,36 @@ class LSBO_problem:
             self.Y = torch.cat([self.Y, cost_tensor], dim=0)
             
             # Log
-            elapsed_time = end_time - start_time
-            print(f"Initial sample {i+1}/{n_initial}: cost={cost:.4f}, time={elapsed_time:.2f}s")
+            elapsed_time = time.time() - start_time
+            print(f"Initial sample {i}/{n_initial} | Cost={cost:.4f} | Iteration time={elapsed_time:.2f}s")
             
             # Log to TensorBoard
-            self.writer.add_scalar('Observations/cost', cost, i)
-            self.writer.add_scalar('Observations/time', elapsed_time, i)
+            self.writer.add_scalar('Outer_loop/cost', cost, i)
+            self.writer.add_scalar('Outer_loop/iteration_time', elapsed_time, i)
+            if i == 1:
+                best_cost = cost
+                self.writer.add_scalar('Outer_loop/best_cost', best_cost, i)
+            
+            elif i > 1:
+                if (self.maximize and cost > best_cost) or (not self.maximize and cost < best_cost):
+                    best_cost = cost
+                    print(f"New best cost: {best_cost:.4f}")
+                    self.writer.add_scalar('Outer_loop/best_cost', best_cost, i)
         
         # If maximizing (e.g., accuracy), negate the values for the GP (BoTorch minimizes by default)
         Y_for_gp = -self.Y if self.maximize else self.Y
             
         # Initialize GP model
         self._update_gp(self.X, Y_for_gp)
+
+        # Log GP hyperparameters in tensorboard
+        self.writer.add_scalar("GP/mean", self.gp.mean_module.constant.item(), n_initial-1)
+        self.writer.add_scalar("GP/output_scale", self.gp.covar_module.outputscale.item(), n_initial-1)
+        lengthscale = self.gp.covar_module.base_kernel.lengthscale
+        if lengthscale.numel() > 1:
+            lengthscale = lengthscale.squeeze()
+        for k in range(len(lengthscale)):
+            self.writer.add_scalar(f"GP/lengthscale_{k}", lengthscale[k].item(), n_initial-1)
         
     def _update_gp(self, X, Y):
         """
@@ -301,27 +370,54 @@ class LSBO_problem:
         Y_standardized = standardize(Y)
 
         # Initialize and fit GP model
-        covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=X_normalized.size(-1)))
+        covar_module = ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=X.shape[-1]))
         self.gp = SingleTaskGP(X_normalized, Y_standardized, covar_module=covar_module)
         mll = ExactMarginalLogLikelihood(self.gp.likelihood, self.gp)
         fit_gpytorch_mll(mll)
         
-    def _optimize_acquisition(self, best_value=None):
-        # Normalize inputs for the GP
-        X_normalized = normalize(self.X, self.bounds, update_constant_bounds=False)
-        
-        # Prepare the acquisition function
+    def _optimize_acquisition(self, iteration=None):        
         if self.acquisition_type == "logEI":
-            # For Expected Improvement
-            Y_for_acq = -self.Y if self.maximize else self.Y
+            Y_star = -self.Y if self.maximize else self.Y
+            Y_star = Y_star.min().item()
             acq_func = LogExpectedImprovement(
                 model=self.gp, 
-                best_f=Y_for_acq.min().item(),
-                maximize=False
+                best_f=Y_star,
+                maximize=self.maximize
+            )
+        elif self.acquisition_type == "EI":
+            Y_star = -self.Y if self.maximize else self.Y
+            Y_star = Y_star.min().item()
+            acq_func = ExpectedImprovement(
+                model=self.gp, 
+                best_f=Y_star,
+                maximize=self.maximize
+            )
+        elif self.acquisition_type == "logPiEI":
+            Y_star = -self.Y if self.maximize else self.Y
+            Y_star = Y_star.min().item()
+            preference_function = self.ae.params_predictor
+            acq_func = LogPiExpectedImprovement(
+                model = self.gp, 
+                best_f = Y_star,
+                pi_func = preference_function,
+                beta = 10,
+                n = iteration,
+                maximize=self.maximize
+            )
+        elif self.acquisition_type == "PiEI":
+            Y_star = -self.Y if self.maximize else self.Y
+            Y_star = Y_star.min().item()
+            preference_function = self.ae.params_predictor
+            acq_func = PiExpectedImprovement(
+                model = self.gp, 
+                best_f = Y_star,
+                pi_func = preference_function,
+                beta = 10,
+                n = iteration,
+                maximize=self.maximize
             )
         else:
-            # Upper Confidence Bound
-            acq_func = UpperConfidenceBound(model=self.gp, beta=2.0)
+            raise ValueError(f"Unsupported acquisition function: {self.acquisition_type}")
         
         # Optimize the acquisition function
         candidate, acq_value = optimize_acqf(
@@ -337,21 +433,10 @@ class LSBO_problem:
         
         # Convert back to original space
         next_z = unnormalize(candidate.squeeze(0), self.bounds)
-        
-        return next_z
+    
+        return next_z, acq_value.item()
         
     def run(self, iterations=100, n_initial=10):
-        """
-        Run the Bayesian optimization process.
-        
-        Args:
-            iterations: Number of optimization iterations
-            n_initial: Number of initial random samples
-            
-        Returns:
-            best_z: The latent vector of the best architecture found
-            best_cost: The cost of the best architecture found
-        """
         # Initialize with random samples
         self._initialize_gp(n_initial)
         
@@ -367,16 +452,15 @@ class LSBO_problem:
         print(f"Starting optimization from best initial cost: {best_cost:.4f}")
         
         # Run optimization iterations
-        for i in range(iterations):
-            print(f"\n--- Iteration {i+1}/{iterations} ---")
+        for i in range(1, iterations+1):
+            start_time = time.time()
+            print(f"\n--- Iteration {i}/{iterations} ---")
             
             # Find next point to evaluate
-            next_z = self._optimize_acquisition()
+            next_z, acq_value = self._optimize_acquisition(iteration = i)
             
             # Evaluate next architecture
-            start_time = time.time()
             cost = self._evaluate_architecture(next_z, model_idx=n_initial+i)
-            end_time = time.time()
             
             # Convert cost to tensor
             cost_tensor = torch.tensor([[cost]], device=self.device)
@@ -385,14 +469,6 @@ class LSBO_problem:
             self.X = torch.cat([self.X, next_z.unsqueeze(0)], dim=0)
             self.Y = torch.cat([self.Y, cost_tensor], dim=0)
             
-            # Log
-            elapsed_time = end_time - start_time
-            print(f"Iteration {i+1}/{iterations}: cost={cost:.4f}, time={elapsed_time:.2f}s")
-            
-            # Log to TensorBoard
-            self.writer.add_scalar('Optimization/cost', cost, n_initial + i)
-            self.writer.add_scalar('Optimization/time', elapsed_time, n_initial + i)
-            
             # Update best architecture
             if (self.maximize and cost > best_cost) or (not self.maximize and cost < best_cost):
                 best_cost = cost
@@ -400,11 +476,26 @@ class LSBO_problem:
                 print(f"New best cost: {best_cost:.4f}")
                 
                 # Log best to TensorBoard
-                self.writer.add_scalar('Optimization/best_cost', best_cost, n_initial + i)
+                self.writer.add_scalar('Outer_loop/best_cost', best_cost, n_initial + i)
             
             # Update GP with all observations
             Y_for_gp = -self.Y if self.maximize else self.Y
             self._update_gp(self.X, Y_for_gp)
+            elapsed_time = time.time() - start_time
+            print(f"Iteration {i}/{iterations} | Cost={cost:.4f} | Iteration time={elapsed_time:.2f}s")
+
+            # Log to TensorBoard
+            self.writer.add_scalar("GP/mean", self.gp.mean_module.constant.item(), n_initial + i)
+            self.writer.add_scalar("GP/output_scale", self.gp.covar_module.outputscale.item(), n_initial + i)
+            lengthscale = self.gp.covar_module.base_kernel.lengthscale
+            if lengthscale.numel() > 1:
+                lengthscale = lengthscale.squeeze()
+            for k in range(len(lengthscale)):
+                self.writer.add_scalar(f"GP/lengthscale_{k}", lengthscale[k].item(), n_initial + i)
+            
+            self.writer.add_scalar('Outer_loop/cost', cost, n_initial + i)
+            self.writer.add_scalar('Outer_loop/acq_value', acq_value, n_initial + i)
+            self.writer.add_scalar('Outer_loop/iteration_time', elapsed_time, n_initial + i)
         
         # Final evaluation of best architecture
         print("\n--- Final Evaluation ---")
@@ -424,18 +515,12 @@ class LSBO_problem:
         return best_z, best_cost
 
     def visualize_best_architecture(self, z=None, filename="best_architecture.png"):
-        """
-        Visualize the best architecture found or a specific architecture from a latent vector.
-        
-        Args:
-            z: Optional latent vector to visualize. If None, uses the best z found.
-            filename: Filename to save the visualization
-        """
         if z is None:
             # Load the best latent vector if available
             best_z_path = os.path.join(self.save_dir, "best_z.pt")
             if os.path.exists(best_z_path):
                 z = torch.load(best_z_path, map_location=self.device)
+                z = z.to(dtype=torch.float32) # Cast to float32 to decode
             else:
                 raise ValueError("No best architecture found. Run the optimization first or provide a latent vector.")
         
@@ -450,10 +535,6 @@ class LSBO_problem:
             n_nodes=self.search_space.graph_features.n_nodes[0]
         )
         
-        # Check if the graph is valid
-        if not graph.is_valid(input_shape=self.input_shape):
-            raise ValueError("The architecture is not valid.")
-        
         # Convert to blueprint
         blueprint = graph.to_blueprint(input_shape=self.input_shape, num_classes=self.num_classes)
         
@@ -465,31 +546,17 @@ class LSBO_problem:
         return blueprint
     
     def evaluate_specific_architecture(self, z):
-        """
-        Evaluate a specific architecture from a latent vector.
-        
-        Args:
-            z: Latent vector to evaluate
-            
-        Returns:
-            cost: The cost value
-        """
         return self._evaluate_architecture(z)
 
 
 def find_argmin(model, input_shape=(2,), lr=0.01, n_steps=2_000, device="cpu"):
     model.to(device)
-    model.eval()  # Set to evaluation mode, as we're not training the model
-    
-    # Create the input tensor that we'll optimize
-    # Note: requires_grad=True is crucial - this tells PyTorch to track gradients
+    model.eval()
     x = torch.randn(input_shape, requires_grad=True, device=device)
     
-    # We'll use Adam optimizer to optimize the input
     optimizer = optim.SGD([x], lr=lr)
-    scheduler = CosineAnnealingAlphaLR(optimizer, T_max=n_steps, alpha=1e-1)
+    scheduler = CosineAnnealingAlphaLR(optimizer, T_max=n_steps, alpha=1e-2)
 
-    # Track the trajectory of optimization
     trajectory = [x.detach().clone()]
     losses = []
     
@@ -497,19 +564,10 @@ def find_argmin(model, input_shape=(2,), lr=0.01, n_steps=2_000, device="cpu"):
     for step in pbar:
         optimizer.zero_grad()
         
-        # Forward pass
-        output = model(x)
-        
-        # We're minimizing the output of the model
-        loss = output
-        
-        # Backward pass
-        loss.backward()
-        
-        # Update the input
+        output = model(x)      
+        loss = output        
+        loss.backward()       
         optimizer.step()
-        with torch.no_grad():
-            x.data.clamp_(-4.0, 4.0)
         scheduler.step()
         
         trajectory.append(x.detach().clone())
@@ -529,45 +587,45 @@ if __name__ == "__main__":
     
     # Create and load the autoencoder
     ae = ArcAE(search_space=search_space, z_dim=99, ae_type="WAE")
-    # TODO: remove next
-    ae.bounds = None
-    checkpoint = torch.load("checkpoints/arcae_20250324_160138/arcae_final.pt", map_location=device)
+    checkpoint = torch.load("checkpoints/arcae_20250325_012519/arcae_final.pt", map_location=device)
     ae.load_state_dict(checkpoint['model_state_dict'])
+    ae.bounds = None
     ae.to(device)
     
-    predictor = ae.params_predictor
-    z, n_params = find_argmin(predictor, input_shape=(99,), lr=1, n_steps=1_000, device="cpu")
-    print(z)
-    print('')
-    with torch.no_grad():
-        ae.eval()
-        v = ae.decode(z.unsqueeze(0))
-    
-    # Create ArcGraph from the graph vector
-    g = ArcGraph(
-        search_space=search_space,
-        V=v[0],
-        n_nodes=search_space.graph_features.n_nodes[0]
-        )
-    # g = ArcGraph(search_space=search_space, V=v, n_nodes=search_space.graph_features.n_nodes[0])
-    
-    g2 = g.to_blueprint(input_shape=[3, 32], num_classes=10)
-    g2.plot(display=True)
-    print(g2.n_params)
-    print(n_params)
 
-    # # Create LSBO problem
-    # lsbo = LSBO_problem(
-    #     trained_ae=ae,
-    #     cost_function="params",  # or "accuracy", "FLOPs"
-    #     dataset="cifar10",
-    #     input_shape=[3, 32],
-    #     log_dir="runs/nas",
-    # )
+
+    # # Predictor based stuff
+    # predictor = ae.FLOPs_predictor
+    # z, FLOPs = find_argmin(predictor, input_shape=(99,), lr=0.1, n_steps=2_000, device="cpu")
+    # with torch.no_grad():
+    #     ae.eval()
+    #     v = ae.decode(z.unsqueeze(0))
+    # # Create ArcGraph from the graph vector
+    # g = ArcGraph(
+    #     search_space=search_space,
+    #     V=v[0],
+    #     n_nodes=search_space.graph_features.n_nodes[0]
+    #     )
+    # g2 = g.to_blueprint(input_shape=[3, 32], num_classes=10)
+    # g2.plot(display=True)
+    # print(g2.FLOPs)
+    # print(FLOPs)
+
+
+    # Bo based stuff
+    # Create LSBO problem
+    lsbo = LSBO_problem(
+        trained_ae=ae,
+        cost_function="params",  # or "accuracy", "FLOPs"
+        acquisition_type="PiEI",
+        dataset="cifar10",
+        input_shape=[3, 32],
+        log_dir="runs/nas",
+    )
     
-    # # Run optimization
-    # best_z, best_cost = lsbo.run(iterations=500, n_initial=4)
+    # Run optimization
+    best_z, best_cost = lsbo.run(iterations=1000, n_initial=99)
     
-    # # Visualize the best architecture
-    # best_blueprint = lsbo.visualize_best_architecture()
-    # print(f"Best architecture has {best_blueprint.n_params:,} parameters and {best_blueprint.FLOPs:,} FLOPs")
+    # Visualize the best architecture
+    best_blueprint = lsbo.visualize_best_architecture()
+    print(f"Best architecture has {best_blueprint.n_params:,} parameters and {best_blueprint.FLOPs:,} FLOPs")
