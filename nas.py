@@ -16,7 +16,6 @@ from botorch.optim import optimize_acqf
 from botorch.models.model import Model
 from botorch.utils.transforms import standardize, normalize, unnormalize
 from gpytorch.mlls import ExactMarginalLogLikelihood
-from gpytorch.constraints import Interval
 from gpytorch.kernels import ScaleKernel, MaternKernel
 
 from graph_utils import ArcGraph
@@ -29,7 +28,17 @@ import torch.nn as nn
 import torch.optim as optim
 
 
+class Lambda(nn.Module):
+    def __init__(self, func):
+        super().__init__()
+        self.func = func
+
+    def forward(self, x):
+        return self.func(x)
+    
+
 class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
+    #TODO: fix
     """
     logPiEI(x) = log([EI*π](x)) = log(EI(x)) + log(π(x)), 
     where π is a provided weighting scheme (preference function)
@@ -43,11 +52,13 @@ class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
         pi_func: torch.nn.Module = None,
         beta: float = 1.0,
         n: int = 1,
-        maximize: bool = True, 
+        maximize: bool = True,
+        bounds: torch.Tensor = None
     ):
         super().__init__(model=model, posterior_transform=posterior_transform)
         self.register_buffer("best_f", torch.as_tensor(best_f))
         self.maximize = maximize
+        self.bounds = bounds
 
         self.beta = beta
         self.n = n
@@ -62,7 +73,7 @@ class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
 
     def forward(self, X: torch.Tensor):
         log_ei_values = self.log_ei(X)
-        pi_values = self.pi_func(X).squeeze()
+        pi_values = self.pi_func(unnormalize(X, self.bounds)).squeeze()
         log_pi_values = torch.log(torch.clamp(pi_values, min=1e-10))
 
         return log_ei_values + (self.beta/self.n)*log_pi_values
@@ -82,11 +93,15 @@ class PiExpectedImprovement(AnalyticAcquisitionFunction):
         pi_func: torch.nn.Module = None,
         beta: float = 1.0,
         n: int = 1,
-        maximize: bool = True, 
+        maximize: bool = True,
+        mode: str = 'mult',
+        bounds: torch.Tensor = None
     ):
         super().__init__(model=model, posterior_transform=posterior_transform)
         self.register_buffer("best_f", torch.as_tensor(best_f))
         self.maximize = maximize
+        self.mode = mode
+        self.bounds = bounds
 
         self.beta = beta
         self.n = n
@@ -101,14 +116,21 @@ class PiExpectedImprovement(AnalyticAcquisitionFunction):
 
     def forward(self, X: torch.Tensor):
         ei_values = self.ei(X)
-        pi_values = self.pi_func(X).squeeze()
+        pi_values = self.pi_func(unnormalize(X, self.bounds)).squeeze()
 
-        return ei_values * (pi_values ** (self.beta/self.n))
+        if self.mode == 'mult':
+            return ei_values * (pi_values ** (self.beta/self.n))
+        elif self.mode == 'add':
+            return ei_values + (self.beta/self.n)*pi_values
+        elif self.mode == 'pi':
+            return pi_values
+        else:
+            raise ValueError(f"Unsupported PiBO mode: {self.mode}")
             
 
 class LSBO_problem:
     def __init__(self, trained_ae, cost_function="accuracy", dataset="cifar10", input_shape=[3, 32], 
-                 num_classes=None, custom_cost_fn=None, log_dir="runs/nas", acquisition_type="logEI"):
+                 num_classes=None, custom_cost_fn=None, log_dir="runs/nas", acquisition_type="logEI", pi_func = None):
 
         self.ae = trained_ae
         self.ae.eval()  # Set autoencoder to evaluation mode
@@ -117,6 +139,7 @@ class LSBO_problem:
         self.input_shape = input_shape
         self.custom_cost_fn = custom_cost_fn
         self.acquisition_type = acquisition_type
+        self.pi_func = pi_func
         # self.device = get_device()
         self.device = "cpu"
         self.z_dim = self.ae.z_dim
@@ -267,6 +290,18 @@ class LSBO_problem:
                 blueprint.plot(output_path=fig_path)
                 
             return cost
+        
+        if self.cost_function == "pred_params":
+            cost = np.float64(self.ae.params_predictor(z.unsqueeze(0)).item())
+            print(f"pred_n_params: {np.exp(cost):,} | pred_log(n_params): {cost:.4f}")
+            blueprint = graph.to_blueprint(input_shape=self.input_shape, num_classes=self.num_classes)
+            
+            # Log the architecture visualization
+            if model_idx is not None:
+                fig_path = os.path.join(self.save_dir, f"arch_{model_idx}.png")
+                blueprint.plot(output_path=fig_path)
+
+            return cost
             
         elif self.cost_function == "FLOPs":
             # Convert to blueprint without converting to PyTorch model
@@ -343,12 +378,9 @@ class LSBO_problem:
                     best_cost = cost
                     print(f"New best cost: {best_cost:.4f}")
                     self.writer.add_scalar('Outer_loop/best_cost', best_cost, i)
-        
-        # If maximizing (e.g., accuracy), negate the values for the GP (BoTorch minimizes by default)
-        Y_for_gp = -self.Y if self.maximize else self.Y
             
         # Initialize GP model
-        self._update_gp(self.X, Y_for_gp)
+        self._update_gp(self.X, self.Y)
 
         # Log GP hyperparameters in tensorboard
         self.writer.add_scalar("GP/mean", self.gp.mean_module.constant.item(), n_initial-1)
@@ -374,44 +406,44 @@ class LSBO_problem:
         
     def _optimize_acquisition(self, iteration=None):        
         if self.acquisition_type == "logEI":
-            Y_star = -self.Y if self.maximize else self.Y
-            Y_star = Y_star.min().item()
+            Y_star = self.Y.max().item() if self.maximize else self.Y.min().item()
             acq_func = LogExpectedImprovement(
                 model=self.gp, 
                 best_f=Y_star,
                 maximize=self.maximize
             )
         elif self.acquisition_type == "EI":
-            Y_star = -self.Y if self.maximize else self.Y
-            Y_star = Y_star.min().item()
+            Y_star = self.Y.max().item() if self.maximize else self.Y.min().item()
             acq_func = ExpectedImprovement(
                 model=self.gp, 
                 best_f=Y_star,
                 maximize=self.maximize
             )
         elif self.acquisition_type == "logPiEI":
-            Y_star = -self.Y if self.maximize else self.Y
-            Y_star = Y_star.min().item()
-            preference_function = self.ae.params_predictor
+            assert self.pi_func is not None, "Preference function (pi_func) must be provided for PiBO"
+            Y_star = self.Y.max().item() if self.maximize else self.Y.min().item()
             acq_func = LogPiExpectedImprovement(
                 model = self.gp, 
                 best_f = Y_star,
-                pi_func = preference_function,
-                beta = 10,
+                pi_func = self.pi_func,
+                beta = 1,
                 n = iteration,
-                maximize=self.maximize
+                maximize=self.maximize,
+                bounds = self.bounds
             )
         elif self.acquisition_type == "PiEI":
-            Y_star = -self.Y if self.maximize else self.Y
-            Y_star = Y_star.min().item()
-            preference_function = self.ae.params_predictor
+            assert self.pi_func is not None, "Preference function (pi_func) must be provided for PiBO"
+            Y_star = self.Y.max().item() if self.maximize else self.Y.min().item()
             acq_func = PiExpectedImprovement(
-                model = self.gp, 
+                model = self.gp,
                 best_f = Y_star,
-                pi_func = preference_function,
-                beta = 10,
+                pi_func = self.pi_func,
+                beta = 1,
+                #TODO
                 n = iteration,
-                maximize=self.maximize
+                maximize=self.maximize,
+                mode = 'mult',
+                bounds = self.bounds
             )
         else:
             raise ValueError(f"Unsupported acquisition function: {self.acquisition_type}")
@@ -468,8 +500,7 @@ class LSBO_problem:
                 self.writer.add_scalar('Outer_loop/best_cost', best_cost, n_initial + i)
             
             # Update GP with all observations
-            Y_for_gp = -self.Y if self.maximize else self.Y
-            self._update_gp(self.X, Y_for_gp)
+            self._update_gp(self.X, self.Y)
             elapsed_time = time.time() - start_time
             print(f"Iteration {i}/{iterations} | Cost={cost:.4f} | Iteration time={elapsed_time:.2f}s")
 
@@ -595,18 +626,28 @@ if __name__ == "__main__":
     # print(FLOPs)
 
 
+    # Create preference function
+    params_pi_func = nn.Sequential(
+        ae.params_predictor,
+        Lambda(lambda x: torch.clamp(x, min=0, max=26)),
+        Lambda(lambda x: x / 26),
+        Lambda(lambda x: (x-0.5)*8),
+        Lambda(lambda x: torch.sigmoid(-x))
+    )
+    
     # Create LSBO problem
     lsbo = LSBO_problem(
         trained_ae=ae,
-        cost_function="params",  # or "accuracy", "FLOPs"
+        cost_function="params",  # or "accuracy", "FLOPs", "pred_params"
         acquisition_type="PiEI",
         dataset="cifar10",
         input_shape=[3, 32],
         log_dir="runs/nas",
+        pi_func = params_pi_func
     )
     
     # Run optimization
-    best_z, best_cost = lsbo.run(iterations=1000, n_initial=99)
+    best_z, best_cost = lsbo.run(iterations=1000, n_initial=2)
     
     # Visualize the best architecture
     best_blueprint = lsbo.visualize_best_architecture()
