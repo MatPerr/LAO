@@ -600,14 +600,32 @@ class ArcGraph(ig.Graph):
         
         def sample_for_node(node_idx, input_shape):
             self.vs[node_idx]["input_shape"] = input_shape
-            out_channels = np.random.choice(self.search_space.node_features.out_channels)
+            if self.search_space.node_feature_probs.out_channels == "uniform":
+                out_channels = np.random.choice(self.search_space.node_features.out_channels)
+            elif type(self.search_space.node_feature_probs.out_channels) == list:
+                out_channels = np.random.choice(self.search_space.node_features.out_channels, p=self.search_space.node_feature_probs.out_channels)
             
-            possible_strides = [s for s in self.search_space.node_features.stride if input_shape[1] % s == 0]
-            stride = np.random.choice(possible_strides)
+            if self.search_space.node_feature_probs.stride == "uniform":
+                possible_strides = [s for s in self.search_space.node_features.stride if input_shape[1] % s == 0]
+                stride = np.random.choice(possible_strides)
+            elif type(self.search_space.node_feature_probs.stride) == list:
+                all_strides = self.search_space.node_features.stride
+                possible_strides_idx = [all_strides.index(s) for s in all_strides if input_shape[1] % s == 0]
+                possible_strides = [all_strides[i] for i in possible_strides_idx]
+                possible_strides_weights = [self.search_space.node_feature_probs.stride[i] for i in possible_strides_idx]
+                possible_strides_probs = np.array(possible_strides_weights) / np.sum(possible_strides_weights)
+                stride = np.random.choice(possible_strides, p=possible_strides_probs)
             
-            possible_groups = [g for g in self.search_space.node_features.groups 
-                            if input_shape[0] % g == 0 and out_channels % g == 0]
-            groups = np.random.choice(possible_groups)
+            if self.search_space.node_feature_probs.groups == "uniform":
+                possible_groups = [g for g in self.search_space.node_features.groups if input_shape[0] % g == 0 and out_channels % g == 0]
+                groups = np.random.choice(possible_groups)
+            elif type(self.search_space.node_feature_probs.groups) == list:
+                all_groups = self.search_space.node_features.groups
+                possible_groups_idx = [all_groups.index(g) for g in all_groups if input_shape[0] % g == 0 and out_channels % g == 0]
+                possible_groups = [all_groups[i] for i in possible_groups_idx]
+                possible_groups_weights = [self.search_space.node_feature_probs.groups[i] for i in possible_groups_idx]
+                possible_groups_probs = np.array(possible_groups_weights) / np.sum(possible_groups_weights)
+                groups = np.random.choice(possible_groups, p=possible_groups_probs)
             
             feature_dict = self.search_space.node_features.__dict__
             node_features = np.empty(len(feature_dict), dtype='object')
@@ -621,8 +639,10 @@ class ArcGraph(ig.Graph):
                 elif feature_name == "groups":
                     node_features[index] = groups
                 else:
-                    node_features[index] = np.random.choice(feature_values)
-            
+                    if self.search_space.node_feature_probs.__dict__[feature_name] == "uniform":
+                        node_features[index] = np.random.choice(feature_values)
+                    elif type(self.search_space.node_feature_probs.__dict__[feature_name]) == list: 
+                        node_features[index] = np.random.choice(feature_values, p=self.search_space.node_feature_probs.__dict__[feature_name])            
             self.vs[node_idx]["features"] = node_features.tolist()
             self.vs[node_idx]["output_shape"] = [out_channels, input_shape[1] // stride]
         

@@ -173,7 +173,7 @@ def get_dataloaders(V, Y, train_split=0.99, batch_size=32, num_workers=0):
     
     return train_dataloader, val_dataloader
 
-# from search_space import *
+from search_space import *
 
-# datagen = DataGenerator(SearchSpace(), input_shape = [3, 32], exp_dir="exp2403")
-# datagen.generate_dataset(1_000_000)
+datagen = DataGenerator(SearchSpace(), input_shape = [3, 32], exp_dir="exp0204")
+datagen.generate_dataset(1_000_000)

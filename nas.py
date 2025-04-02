@@ -38,7 +38,6 @@ class Lambda(nn.Module):
     
 
 class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
-    #TODO: fix
     """
     logPiEI(x) = log([EI*π](x)) = log(EI(x)) + log(π(x)), 
     where π is a provided weighting scheme (preference function)
@@ -291,6 +290,7 @@ class LSBO_problem:
                 
             return cost
         
+        
         if self.cost_function == "pred_params":
             cost = np.float64(self.ae.params_predictor(z.unsqueeze(0)).item())
             print(f"pred_n_params: {np.exp(cost):,} | pred_log(n_params): {cost:.4f}")
@@ -309,6 +309,40 @@ class LSBO_problem:
             flops = blueprint.FLOPs
             cost = np.log(flops)
             print(f"FLOPs: {flops:,} | log(FLOPs): {cost:.4f}")
+            
+            # Log the architecture visualization
+            if model_idx is not None:
+                fig_path = os.path.join(self.save_dir, f"arch_{model_idx}.png")
+                blueprint.plot(output_path=fig_path)
+                
+            return cost
+        
+        if self.cost_function == "target_BBGP":
+            # Convert to blueprint without converting to PyTorch model
+            blueprint = graph.to_blueprint(input_shape=self.input_shape, num_classes=self.num_classes)
+            BBGP = blueprint.BBGP
+            cost = np.abs(np.log2(BBGP)-2)
+            print(f"BBGP: {BBGP:,} | log2(BBGP): {np.log2(BBGP):.4f}")
+            
+            # Log the architecture visualization
+            if model_idx is not None:
+                fig_path = os.path.join(self.save_dir, f"arch_{model_idx}.png")
+                blueprint.plot(output_path=fig_path)
+                
+            return cost
+        
+        if self.cost_function == "params_x_FLOPs_x_target_BBGP":
+            # Convert to blueprint without converting to PyTorch model
+            blueprint = graph.to_blueprint(input_shape=self.input_shape, num_classes=self.num_classes)
+            # blueprint.plot(display=True)
+            n_params = blueprint.n_params
+            FLOPs = blueprint.FLOPs
+            BBGP = blueprint.BBGP
+            c_params = np.log(n_params)
+            c_FLOPs = np.log(FLOPs/1000)
+            c_BBGP = 5*np.abs(np.log2(BBGP)-2)
+            cost = c_params * c_FLOPs * c_BBGP
+            print(f"n_params: {n_params:,} | FLOPs {FLOPs:,} | BBGP {BBGP:,} | cost: {cost:.4f} | c_n_params: {c_params:.4f} | c_FLOPs: {c_FLOPs:.4f} | c_BBGP: {c_BBGP:.4f}")
             
             # Log the architecture visualization
             if model_idx is not None:
@@ -439,7 +473,6 @@ class LSBO_problem:
                 best_f = Y_star,
                 pi_func = self.pi_func,
                 beta = 1,
-                #TODO
                 n = iteration,
                 maximize=self.maximize,
                 mode = 'mult',
@@ -629,25 +662,56 @@ if __name__ == "__main__":
     # Create preference function
     params_pi_func = nn.Sequential(
         ae.params_predictor,
-        Lambda(lambda x: torch.clamp(x, min=0, max=26)),
+        Lambda(lambda x: torch.clamp(x, min=0, max=30)),
         Lambda(lambda x: x / 26),
         Lambda(lambda x: (x-0.5)*8),
         Lambda(lambda x: torch.sigmoid(-x))
     )
+
+    FLOPs_pi_func = nn.Sequential(
+        ae.FLOPs_predictor,
+        Lambda(lambda x: torch.clamp(x, min=0, max=60)),
+        Lambda(lambda x: x / 60),
+        Lambda(lambda x: (x-0.5)*8),
+        Lambda(lambda x: torch.sigmoid(-x))
+    )
+
+    target_BBGP_pi_func = nn.Sequential(
+        ae.BBGP_predictor,
+        Lambda(lambda x: torch.clamp(x, min=0, max=12)),
+        Lambda(lambda x: x-2),
+        Lambda(lambda x: torch.abs(x)),
+        Lambda(lambda x: x / 3),
+        Lambda(lambda x: (x-0.5)*8),
+        Lambda(lambda x: torch.sigmoid(-x))
+    )
     
+    class prod_pi_func(nn.Module):
+        def __init__(self, pi_funcs):
+            super().__init__()
+            self.pi_funcs = pi_funcs
+        
+        def forward(self, x):
+            result = self.pi_funcs[0](x)           
+            for pi_func in self.pi_funcs[1:]:
+                result = result * pi_func(x)
+            
+            return result
+
+
     # Create LSBO problem
     lsbo = LSBO_problem(
         trained_ae=ae,
-        cost_function="params",  # or "accuracy", "FLOPs", "pred_params"
-        acquisition_type="PiEI",
+        cost_function="target_BBGP",  # or "accuracy", "FLOPs", "pred_params" or "params_x_FLOPs_x_BBGP"
+        acquisition_type="logEI",
         dataset="cifar10",
         input_shape=[3, 32],
         log_dir="runs/nas",
-        pi_func = params_pi_func
+        pi_func = target_BBGP_pi_func
     )
     
     # Run optimization
-    best_z, best_cost = lsbo.run(iterations=1000, n_initial=2)
+    best_z, best_cost = lsbo.run(iterations=1000, n_initial=100)
     
     # Visualize the best architecture
     best_blueprint = lsbo.visualize_best_architecture()
