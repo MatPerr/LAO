@@ -604,7 +604,7 @@ def find_argmin(model, input_shape=(2,), lr=0.01, n_steps=2_000, device="cpu"):
     model.eval()
     x = torch.randn(input_shape, requires_grad=True, device=device)
     
-    optimizer = optim.SGD([x], lr=lr)
+    optimizer = optim.Adam([x], lr=lr)
     scheduler = CosineAnnealingAlphaLR(optimizer, T_max=n_steps, alpha=1e-2)
 
     trajectory = [x.detach().clone()]
@@ -615,7 +615,7 @@ def find_argmin(model, input_shape=(2,), lr=0.01, n_steps=2_000, device="cpu"):
         optimizer.zero_grad()
         
         output = model(x)      
-        loss = output        
+        loss = nn.MSELoss()(output, torch.Tensor(12))
         loss.backward()       
         optimizer.step()
         scheduler.step()
@@ -635,84 +635,87 @@ if __name__ == "__main__":
     
     # Create and load the autoencoder
     ae = ArcAE(search_space=search_space, z_dim=99, ae_type="WAE")
-    checkpoint = torch.load("checkpoints/arcae_20250325_012519/arcae_final.pt", map_location=device)
+    # All ICNN
+    checkpoint = torch.load("checkpoints/arcae_20250402_231330/arcae_final.pt", map_location=device)
+    # All NO ICNN
+    # checkpoint = torch.load("checkpoints/arcae_20250403_092511/arcae_final.pt", map_location=device)
+
     ae.load_state_dict(checkpoint['model_state_dict'])
     ae.bounds = None
     ae.to(device)
     
+    # Descend gradient of predictor's input
+    predictor = ae.params_predictor
+    z, n_params = find_argmin(predictor, input_shape=(99,), lr=0.1, n_steps=5_000, device="cpu")
+    with torch.no_grad():
+        ae.eval()
+        v = ae.decode(z.unsqueeze(0))
+    # Create ArcGraph from the graph vector
+    g = ArcGraph(
+        search_space=search_space,
+        V=v[0],
+        n_nodes=search_space.graph_features.n_nodes[0]
+        )
+    g2 = g.to_blueprint(input_shape=[3, 32], num_classes=10)
+    g2.plot(display=True)
+    print(g2.n_params)
+    print(n_params)
 
-    # # Descend gradient of predictor's input
-    # predictor = ae.FLOPs_predictor
-    # z, FLOPs = find_argmin(predictor, input_shape=(99,), lr=0.1, n_steps=2_000, device="cpu")
-    # with torch.no_grad():
-    #     ae.eval()
-    #     v = ae.decode(z.unsqueeze(0))
-    # # Create ArcGraph from the graph vector
-    # g = ArcGraph(
-    #     search_space=search_space,
-    #     V=v[0],
-    #     n_nodes=search_space.graph_features.n_nodes[0]
-    #     )
-    # g2 = g.to_blueprint(input_shape=[3, 32], num_classes=10)
-    # g2.plot(display=True)
-    # print(g2.FLOPs)
-    # print(FLOPs)
 
+    # # Create preference function
+    # params_pi_func = nn.Sequential(
+    #     ae.params_predictor,
+    #     Lambda(lambda x: torch.clamp(x, min=0, max=30)),
+    #     Lambda(lambda x: x / 26),
+    #     Lambda(lambda x: (x-0.5)*8),
+    #     Lambda(lambda x: torch.sigmoid(-x))
+    # )
 
-    # Create preference function
-    params_pi_func = nn.Sequential(
-        ae.params_predictor,
-        Lambda(lambda x: torch.clamp(x, min=0, max=30)),
-        Lambda(lambda x: x / 26),
-        Lambda(lambda x: (x-0.5)*8),
-        Lambda(lambda x: torch.sigmoid(-x))
-    )
+    # FLOPs_pi_func = nn.Sequential(
+    #     ae.FLOPs_predictor,
+    #     Lambda(lambda x: torch.clamp(x, min=0, max=60)),
+    #     Lambda(lambda x: x / 60),
+    #     Lambda(lambda x: (x-0.5)*8),
+    #     Lambda(lambda x: torch.sigmoid(-x))
+    # )
 
-    FLOPs_pi_func = nn.Sequential(
-        ae.FLOPs_predictor,
-        Lambda(lambda x: torch.clamp(x, min=0, max=60)),
-        Lambda(lambda x: x / 60),
-        Lambda(lambda x: (x-0.5)*8),
-        Lambda(lambda x: torch.sigmoid(-x))
-    )
-
-    target_BBGP_pi_func = nn.Sequential(
-        ae.BBGP_predictor,
-        Lambda(lambda x: torch.clamp(x, min=0, max=12)),
-        Lambda(lambda x: x-2),
-        Lambda(lambda x: torch.abs(x)),
-        Lambda(lambda x: x / 3),
-        Lambda(lambda x: (x-0.5)*8),
-        Lambda(lambda x: torch.sigmoid(-x))
-    )
+    # target_BBGP_pi_func = nn.Sequential(
+    #     ae.BBGP_predictor,
+    #     Lambda(lambda x: torch.clamp(x, min=0, max=12)),
+    #     Lambda(lambda x: x-2),
+    #     Lambda(lambda x: torch.abs(x)),
+    #     Lambda(lambda x: x / 3),
+    #     Lambda(lambda x: (x-0.5)*8),
+    #     Lambda(lambda x: torch.sigmoid(-x))
+    # )
     
-    class prod_pi_func(nn.Module):
-        def __init__(self, pi_funcs):
-            super().__init__()
-            self.pi_funcs = pi_funcs
+    # class prod_pi_func(nn.Module):
+    #     def __init__(self, pi_funcs):
+    #         super().__init__()
+    #         self.pi_funcs = pi_funcs
         
-        def forward(self, x):
-            result = self.pi_funcs[0](x)           
-            for pi_func in self.pi_funcs[1:]:
-                result = result * pi_func(x)
+    #     def forward(self, x):
+    #         result = self.pi_funcs[0](x)           
+    #         for pi_func in self.pi_funcs[1:]:
+    #             result = result * pi_func(x)
             
-            return result
+    #         return result
 
 
-    # Create LSBO problem
-    lsbo = LSBO_problem(
-        trained_ae=ae,
-        cost_function="target_BBGP",  # or "accuracy", "FLOPs", "pred_params" or "params_x_FLOPs_x_BBGP"
-        acquisition_type="logEI",
-        dataset="cifar10",
-        input_shape=[3, 32],
-        log_dir="runs/nas",
-        pi_func = target_BBGP_pi_func
-    )
+    # # Create LSBO problem
+    # lsbo = LSBO_problem(
+    #     trained_ae=ae,
+    #     cost_function="params",  # or "accuracy", "FLOPs", "pred_params" or "params_x_FLOPs_x_BBGP"
+    #     acquisition_type="logPiEI",
+    #     dataset="cifar10",
+    #     input_shape=[3, 32],
+    #     log_dir="runs/nas",
+    #     pi_func = params_pi_func
+    # )
     
-    # Run optimization
-    best_z, best_cost = lsbo.run(iterations=1000, n_initial=100)
+    # # Run optimization
+    # best_z, best_cost = lsbo.run(iterations=1000, n_initial=2)
     
-    # Visualize the best architecture
-    best_blueprint = lsbo.visualize_best_architecture()
-    print(f"Best architecture has {best_blueprint.n_params:,} parameters and {best_blueprint.FLOPs:,} FLOPs")
+    # # Visualize the best architecture
+    # best_blueprint = lsbo.visualize_best_architecture()
+    # print(f"Best architecture has {best_blueprint.n_params:,} parameters and {best_blueprint.FLOPs:,} FLOPs")

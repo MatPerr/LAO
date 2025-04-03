@@ -380,14 +380,15 @@ if __name__ == "__main__":
     
     # Create and load the autoencoder
     ae = ArcAE(search_space=search_space, z_dim=99, ae_type="WAE")
-    checkpoint = torch.load("checkpoints/arcae_20250325_012519/arcae_final.pt", map_location=device)
+    # checkpoint = torch.load("checkpoints/arcae_20250403_083352/arcae_best.pt", map_location=device)
+    checkpoint = torch.load("checkpoints/arcae_20250403_092511/arcae_best.pt", map_location=device)
     ae.load_state_dict(checkpoint['model_state_dict'])
     ae.to(device)
     
     # Sample and visualize latent vectors
     metrics = sample_and_visualize_latent_vectors(
         trained_ae=ae,
-        n_samples=1000,
+        n_samples=10000,
         input_shape=[3, 32],
         num_classes=10,
         save_dir="latent_analysis",

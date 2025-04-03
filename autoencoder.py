@@ -330,9 +330,9 @@ class ArcAE(nn.Module):
         self.decoder_base = nn.Sequential(*decoder_layers)
 
         # Predictors
-        self.params_predictor = ICNN(z_dim, [512]*2)
-        self.FLOPs_predictor = ICNN(z_dim, [512]*2)
-        self.BBGP_predictor = ICNN(z_dim, [512]*2)
+        self.params_predictor = ICNN(z_dim, [512]*2, convex_flag=False)
+        self.FLOPs_predictor = ICNN(z_dim, [512]*2, convex_flag=False)
+        self.BBGP_predictor = ICNN(z_dim, [512]*2, convex_flag=False)
         
     def encode(self, v):
         v = self.encoder_base(v)
@@ -547,24 +547,21 @@ class ArcAE(nn.Module):
         return all_z
     
 
-    def viz_decoded_prior(self, writer, global_step, device, num_samples=10_000):
-        """
-        Sample random vectors from the latent space, decode them into graphs,
-        and visualize the distribution of node features and adjacency matrix.
-        """
+    def viz_decoded_prior(self, writer, global_step, device, train_dl, num_samples=10_000):
         import numpy as np
         import matplotlib.pyplot as plt
         import torch
         import io
         from PIL import Image
         from torchvision.transforms import ToTensor
+        from tqdm import tqdm
         
         self.eval()  # Set model to evaluation mode
         n_nodes = self.search_space.graph_features.n_nodes[0]
         feature_names = list(self.search_space.node_features.__dict__.keys())
         feature_values = list(self.search_space.node_features.__dict__.values())
         
-        # Generate random normal vectors
+        # Part 1: Generate samples from the prior
         with torch.no_grad():
             z_samples = torch.randn(num_samples, self.z_dim, device=device)
             decoded_vectors = self.decode(z_samples)
@@ -614,7 +611,60 @@ class ArcAE(nn.Module):
                     # Reshape back and store
                     decoded_features[:, :, j] = decoded_flat_np.reshape(batch_size, n_nodes)
         
-        # Create a grid of histograms for each node and feature
+        # Part 2: Collect samples from training data
+        train_features = np.empty((0, n_nodes, len(feature_names)), dtype='object')
+        train_adj = np.empty((0, self.nA), dtype=np.float32)
+        
+        # Limit the number of batches to process to avoid excessive computation
+        max_batches = min(30, len(train_dl))  # Adjust as needed
+        samples_collected = 0
+        
+        with torch.no_grad():
+            for batch_idx, (v, _) in enumerate(tqdm(train_dl, desc="Processing training data", leave=False)):
+                if batch_idx >= max_batches or samples_collected >= num_samples:
+                    break
+                    
+                v = v.to(device)
+                batch_size = v.shape[0]
+                samples_collected += batch_size
+                
+                # Split into features and adjacency
+                train_X, train_A = torch.split(v, [self.nX, self.nA], dim=1)
+                train_adj = np.vstack([train_adj, train_A.cpu().numpy()])
+                
+                if self.node_encoding_type == "categorical":
+                    # Process categorical features
+                    train_X_parts = torch.split(train_X.view(batch_size, n_nodes, -1), self.feature_widths, dim=2)
+                    batch_features = np.empty((batch_size, n_nodes, len(feature_names)), dtype='object')
+                    
+                    for j, (feature_part, possible_values) in enumerate(zip(train_X_parts, feature_values)):
+                        one_hot_indices = torch.argmax(feature_part, dim=2).cpu().numpy()
+                        for b in range(batch_size):
+                            for i in range(n_nodes):
+                                idx = one_hot_indices[b, i]
+                                batch_features[b, i, j] = possible_values[idx]
+                                
+                elif self.node_encoding_type == "quantized":
+                    # Process quantized features
+                    train_X = train_X.view(batch_size, n_nodes, -1)
+                    batch_features = np.empty((batch_size, n_nodes, len(feature_names)), dtype='object')
+                    
+                    for j, possible_values in enumerate(feature_values):
+                        feature_flat = train_X[:, :, j].reshape(-1, 1)
+                        decoded_flat = batch_quantized_decode(feature_flat, possible_values)
+                        decoded_flat_np = decoded_flat.cpu().numpy().flatten()
+                        batch_features[:, :, j] = decoded_flat_np.reshape(batch_size, n_nodes)
+                
+                train_features = np.vstack([train_features, batch_features])
+                
+                if samples_collected >= num_samples:
+                    break
+        
+        # Limit to the same number of samples as the prior
+        train_features = train_features[:num_samples]
+        train_adj = train_adj[:num_samples]
+        
+        # Part 3: Create visualization with side-by-side comparison
         fig_width = 5 * len(feature_names)
         fig_height = 4 * n_nodes
         fig, axes = plt.subplots(n_nodes, len(feature_names), figsize=(fig_width, fig_height))
@@ -630,32 +680,45 @@ class ArcAE(nn.Module):
         if len(feature_names) == 1:
             axes = axes.reshape(-1, 1)
         
+        # Define colors for the two distributions
+        prior_color = 'royalblue'
+        train_color = 'mediumseagreen'
+        
         # For each node and feature, create a histogram
         for i in range(n_nodes):
             for j, (feature_name, feature_vals) in enumerate(zip(feature_names, feature_values)):
                 ax = axes[i, j]
                 
                 # Get all decoded values for this node and feature across samples
-                feature_values_for_node = decoded_features[:, i, j]
+                prior_values = decoded_features[:, i, j]
+                train_values = train_features[:, i, j]
                 
-                # Count occurrences of each value
-                unique_vals, counts = np.unique(feature_values_for_node, return_counts=True)
-                
-                # Prepare data for bar chart with all possible values
-                plot_counts = np.zeros(len(feature_vals))
+                # Count occurrences of each value in prior
+                prior_unique, prior_counts = np.unique(prior_values, return_counts=True)
+                prior_probs = np.zeros(len(feature_vals))
                 for val_idx, val in enumerate(feature_vals):
-                    matching_idx = np.where(unique_vals == val)[0]
+                    matching_idx = np.where(prior_unique == val)[0]
                     if len(matching_idx) > 0:
-                        plot_counts[val_idx] = counts[matching_idx[0]]
+                        prior_probs[val_idx] = prior_counts[matching_idx[0]] / len(prior_values)
                 
-                # Normalize to get probabilities
-                probs = plot_counts / np.sum(plot_counts) if np.sum(plot_counts) > 0 else plot_counts
+                # Count occurrences of each value in training data
+                train_unique, train_counts = np.unique(train_values, return_counts=True)
+                train_probs = np.zeros(len(feature_vals))
+                for val_idx, val in enumerate(feature_vals):
+                    matching_idx = np.where(train_unique == val)[0]
+                    if len(matching_idx) > 0:
+                        train_probs[val_idx] = train_counts[matching_idx[0]] / len(train_values)
                 
-                # Create bar plot with aligned x-ticks to feature values
-                bars = ax.bar(range(len(feature_vals)), probs)
+                # Set up bar positions
+                x = np.arange(len(feature_vals))
+                width = 0.35  # Width of the bars
+                
+                # Create grouped bar chart
+                ax.bar(x - width/2, prior_probs, width, label='Generated', color=prior_color, alpha=0.8)
+                ax.bar(x + width/2, train_probs, width, label='Training', color=train_color, alpha=0.8)
                 
                 # Annotate x-axis with actual feature values
-                ax.set_xticks(range(len(feature_vals)))
+                ax.set_xticks(x)
                 
                 # Format x-tick labels based on feature type
                 if isinstance(feature_vals[0], int) or isinstance(feature_vals[0], float):
@@ -663,31 +726,21 @@ class ArcAE(nn.Module):
                 else:  # For string values like "sum", "gate"
                     ax.set_xticklabels([str(val) for val in feature_vals])
                 
-                # Add value annotations on top of bars
-                for bar_idx, bar in enumerate(bars):
-                    height = bar.get_height()
-                    if height > 0.01:  # Only annotate bars with significant probability
-                        ax.text(
-                            bar.get_x() + bar.get_width()/2.,
-                            height + 0.01,
-                            f'{height:.2f}',
-                            ha='center', 
-                            va='bottom', 
-                            fontsize=8,
-                            rotation=45 if len(feature_vals) > 8 else 0
-                        )
-                
                 # Set title and labels
                 alias = self.search_space.aliases.get(feature_name, feature_name)
                 ax.set_title(f'Node {i}: {alias}')
                 ax.set_ylabel('Probability')
+                
+                # Only add legend to the first plot
+                if i == 0 and j == 0:
+                    ax.legend()
                 
                 # Rotate x-tick labels if there are many values
                 if len(feature_vals) > 4:
                     plt.setp(ax.get_xticklabels(), rotation=45, ha='right')
         
         # Set overall title
-        fig.suptitle(f'Distribution of Decoded Node Features (Step {global_step})', fontsize=16)
+        fig.suptitle(f'Distribution of Node Features: Generated vs Training (Step {global_step})', fontsize=16)
         
         # Save figure to tensorboard
         buf = io.BytesIO()
@@ -696,50 +749,111 @@ class ArcAE(nn.Module):
         
         # Convert to tensor and log to tensorboard
         image = ToTensor()(Image.open(buf))
-        writer.add_image('decoded_features_distribution', image, global_step)
+        writer.add_image('features_distribution_comparison', image, global_step)
         
         # Close figure to free memory
         plt.close(fig)
         
-        # Also create a visualization of the adjacency matrix distribution
-        plt.figure(figsize=(10, 8))
+        # Part 4: Create visualization of adjacency matrices
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
         
-        # Calculate average adjacency matrix
-        avg_adj = np.mean(decoded_A, axis=0)
-        
-        # Reshape to square matrix for visualization
+        # Process adjacency matrices
+        # For generated data
+        prior_avg_adj = np.mean(decoded_A, axis=0)
+        prior_adj_matrix = np.zeros((n_nodes, n_nodes))
         adj_idx = 0
-        avg_adj_matrix = np.zeros((n_nodes, n_nodes))
         for i in range(n_nodes):
             for j in range(i + 1, n_nodes):
-                avg_adj_matrix[i, j] = avg_adj[adj_idx]
+                prior_adj_matrix[i, j] = prior_avg_adj[adj_idx]
                 adj_idx += 1
         
-        # Create heatmap
-        plt.imshow(avg_adj_matrix, cmap='Blues', vmin=0, vmax=1)
-        plt.colorbar(label='Average Connection Probability')
-        plt.title(f'Average Adjacency Matrix from Latent Samples (Step {global_step})')
-        plt.xlabel('Node Index')
-        plt.ylabel('Node Index')
+        # For training data
+        train_avg_adj = np.mean(train_adj, axis=0)
+        train_adj_matrix = np.zeros((n_nodes, n_nodes))
+        adj_idx = 0
+        for i in range(n_nodes):
+            for j in range(i + 1, n_nodes):
+                train_adj_matrix[i, j] = train_avg_adj[adj_idx]
+                adj_idx += 1
         
-        # Add text annotations for probabilities
+        # Create heatmaps
+        im1 = ax1.imshow(prior_adj_matrix, cmap='Blues', vmin=0, vmax=1)
+        ax1.set_title('Generated Adjacency Matrix')
+        ax1.set_xlabel('Node Index')
+        ax1.set_ylabel('Node Index')
+        fig.colorbar(im1, ax=ax1, label='Connection Probability')
+        
+        # Add text annotations for generated data
         for i in range(n_nodes):
             for j in range(n_nodes):
-                if avg_adj_matrix[i, j] > 0:
-                    plt.text(j, i, f'{avg_adj_matrix[i, j]:.2f}',
-                            ha='center', va='center', color='black' if avg_adj_matrix[i, j] < 0.5 else 'white')
+                if prior_adj_matrix[i, j] > 0:
+                    ax1.text(j, i, f'{prior_adj_matrix[i, j]:.2f}',
+                            ha='center', va='center', color='black' if prior_adj_matrix[i, j] < 0.5 else 'white')
         
-        # Save adjacency matrix figure to tensorboard
+        im2 = ax2.imshow(train_adj_matrix, cmap='Greens', vmin=0, vmax=1)
+        ax2.set_title('Training Data Adjacency Matrix')
+        ax2.set_xlabel('Node Index')
+        ax2.set_ylabel('Node Index')
+        fig.colorbar(im2, ax=ax2, label='Connection Probability')
+        
+        # Add text annotations for training data
+        for i in range(n_nodes):
+            for j in range(n_nodes):
+                if train_adj_matrix[i, j] > 0:
+                    ax2.text(j, i, f'{train_adj_matrix[i, j]:.2f}',
+                            ha='center', va='center', color='black' if train_adj_matrix[i, j] < 0.5 else 'white')
+        
+        # Set overall title
+        fig.suptitle(f'Adjacency Matrix Comparison (Step {global_step})', fontsize=16)
+        plt.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust layout to accommodate suptitle
+        
+        # Save figure to tensorboard
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
         buf.seek(0)
         
         # Convert to tensor and log to tensorboard
         image = ToTensor()(Image.open(buf))
-        writer.add_image('decoded_adjacency_distribution', image, global_step)
+        writer.add_image('adjacency_comparison', image, global_step)
         
         # Close figure to free memory
         plt.close()
+        
+        # Part 5: Create detailed comparison of edge connection probabilities
+        if n_nodes <= 20:  # Only do this for reasonably sized networks
+            plt.figure(figsize=(12, 8))
+            
+            # Flatten adjacency matrices for easier plotting
+            edge_labels = []
+            for i in range(n_nodes):
+                for j in range(i + 1, n_nodes):
+                    edge_labels.append(f"{i}->{j}")
+            
+            indices = np.arange(len(edge_labels))
+            width = 0.35
+            
+            # Plot bar chart of connection probabilities
+            plt.bar(indices - width/2, prior_avg_adj, width, label='Generated', color=prior_color, alpha=0.8)
+            plt.bar(indices + width/2, train_avg_adj, width, label='Training', color=train_color, alpha=0.8)
+            
+            plt.xlabel('Edge')
+            plt.ylabel('Connection Probability')
+            plt.title('Edge Connection Probabilities: Generated vs Training')
+            plt.xticks(indices, edge_labels, rotation=90)
+            plt.legend()
+            plt.tight_layout()
+            
+            # Save figure to tensorboard
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            buf.seek(0)
+            
+            # Convert to tensor and log to tensorboard
+            image = ToTensor()(Image.open(buf))
+            writer.add_image('edge_probabilities_comparison', image, global_step)
+            
+            # Close figure to free memory
+            plt.close()
         
         self.train()  # Switch back to training mode
         return
@@ -795,7 +909,7 @@ class ArcAE(nn.Module):
                 if (global_step + 1) % log_latent_every == 0:
                     tqdm.write(f"Logging latent space distributions at step {global_step+1}")
                     self.log_latent_space(train_dl, writer, global_step, device)
-                    self.viz_decoded_prior(writer, global_step, device)
+                    self.viz_decoded_prior(writer, global_step, device, train_dl)
                 
                 # Validation
                 if (global_step + 1) % val_every == 0:
@@ -862,7 +976,7 @@ class ArcAE(nn.Module):
         # Log latent space distributions for final model
         tqdm.write("Logging latent space distributions for final model")
         self.log_latent_space(train_dl, writer, global_step, device)
-        self.viz_decoded_prior(writer, global_step, device)
+        self.viz_decoded_prior(writer, global_step, device, train_dl)
         
         # Save final model
         final_checkpoint_path = os.path.join(save_dir, "arcae_final.pt")
@@ -883,9 +997,12 @@ class ArcAE(nn.Module):
 # data = torch.load("exp1903/graph_data/1000000_samples_0319_1028.pt")
 # data = torch.load("exp2303/graph_data/1000000_samples_0323_0144.pt")
 # data = torch.load("exp2403/graph_data/1000000_samples_0325_0013.pt")
-# train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
+# data = torch.load("exp0204/graph_data/1000000_samples_0402_2300.pt")
 
-# from search_space import *
+data = torch.load("exp0304/graph_data/1000000_samples_0403_1706.pt")
+train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
 
-# ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
-# ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")
+from search_space import *
+
+ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
+ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")

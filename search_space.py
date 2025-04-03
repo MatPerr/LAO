@@ -15,7 +15,7 @@ class NodeFeatureProbs:
     """Probabilities for sampling node features"""
     out_channels: Union[List[float], str] = "uniform"
     kernel_size: Union[List[float], str] = "uniform"
-    stride: Union[List[float], str] = field(default_factory=lambda: [17/20, 3/20])
+    stride: Union[List[float], str] = field(default_factory=lambda: [18/20, 2/20])
     groups: Union[List[float], str] = "uniform"
     # squeeze_excitation: Union[List[float], str] = "uniform" 
     # aggregation: Union[List[float], str] = "uniform"
