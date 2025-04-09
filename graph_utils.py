@@ -945,6 +945,10 @@ class ArcGraph(ig.Graph):
                 
                 execution_order = []
                 visited = set()
+
+                self.n_params = blueprint.n_params
+                self.FLOPs = blueprint.FLOPs
+                self.BBGP = blueprint.BBGP
                 
                 def visit(node_idx):
                     if node_idx in visited:

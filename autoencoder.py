@@ -259,6 +259,85 @@ def batch_quantized_decode(quantized_values_batch, possible_values):
     return decoded_values
 
 
+def ordered_logistic_loss(predictions, targets, possible_values, device=None):
+    """
+    Ordered logistic regression loss for quantized values.
+    
+    Args:
+        predictions: Raw predicted values (batch_size, n_nodes, n_features)
+        targets: Target quantized values (batch_size, n_nodes, n_features)
+        possible_values: List of lists, each containing possible values for a feature
+        device: Device to create tensors on
+    
+    Returns:
+        Loss value
+    """
+    if device is None:
+        device = predictions.device
+        
+    batch_size, n_nodes, n_features = predictions.shape
+    total_loss = 0.0
+    
+    for j in range(n_features):
+        feature_values = possible_values[j]
+        n_bins = len(feature_values)
+        
+        # Skip if there's only one possible value
+        if n_bins <= 1:
+            continue
+            
+        # Calculate bin edges
+        bin_width = 1.0 / n_bins
+        bin_edges = torch.tensor([i * bin_width for i in range(n_bins+1)], device=device)
+        
+        # Get predictions and targets for this feature
+        feature_preds = predictions[:, :, j].reshape(-1)
+        feature_targets = targets[:, :, j].reshape(-1)
+        
+        # Convert targets to bin indices
+        target_indices = torch.zeros_like(feature_targets, dtype=torch.long)
+        for i, val in enumerate(feature_values):
+            target_indices[feature_targets == val] = i
+            
+        # Calculate cumulative probabilities for each threshold
+        cumulative_probs = []
+        for threshold in bin_edges[1:-1]:  # Skip first and last edge
+            prob = torch.sigmoid(feature_preds - threshold)
+            cumulative_probs.append(prob)
+            
+        if not cumulative_probs:  # Binary case
+            threshold = 0.5
+            probs = torch.sigmoid(feature_preds - threshold)
+            loss = F.binary_cross_entropy(probs, target_indices.float())
+            total_loss += loss
+            continue
+            
+        # Stack probabilities
+        probs = torch.stack(cumulative_probs, dim=1)
+        
+        # Calculate probabilities for each bin
+        bin_probs = torch.zeros((feature_preds.size(0), n_bins), device=device)
+        
+        # First bin: 1 - P(y > 1)
+        bin_probs[:, 0] = 1.0 - probs[:, 0]
+        
+        # Middle bins: P(y > k-1) - P(y > k)
+        for k in range(1, n_bins-1):
+            bin_probs[:, k] = probs[:, k-1] - probs[:, k]
+            
+        # Last bin: P(y > K-1)
+        bin_probs[:, -1] = probs[:, -1] if probs.size(1) > 0 else (1.0 - bin_probs[:, 0])
+        
+        # Apply small epsilon to avoid log(0)
+        bin_probs = torch.clamp(bin_probs, min=1e-8, max=1.0-1e-8)
+        
+        # Negative log likelihood of correct bin
+        loss = F.nll_loss(torch.log(bin_probs), target_indices)
+        total_loss += loss
+        
+    return total_loss / n_features
+
+
 class ArcAE(nn.Module):
     def __init__(self,
                  search_space,
@@ -361,7 +440,7 @@ class ArcAE(nn.Module):
         
         # Split into node features and adjacency components
         v_X, v_A = torch.split(h, [self.nX, self.nA], dim=1)
-        
+
         # Process adjacency matrix (same for both encoding types)
         v_A = (nn.Sigmoid()(v_A) > 0.5) * 1.0
         
@@ -413,6 +492,7 @@ class ArcAE(nn.Module):
 
         # Split node and edge parts
         v_X_hat, v_A_hat = torch.split(h, [self.nX, self.nA], dim=1)
+
         v_X, v_A = torch.split(v, [self.nX, self.nA], dim=1)
 
         # Edge loss
@@ -999,10 +1079,10 @@ class ArcAE(nn.Module):
 # data = torch.load("exp2403/graph_data/1000000_samples_0325_0013.pt")
 # data = torch.load("exp0204/graph_data/1000000_samples_0402_2300.pt")
 
-data = torch.load("exp0304/graph_data/1000000_samples_0403_1706.pt")
-train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
+# data = torch.load("exp0304/graph_data/1000000_samples_0403_1706.pt")
+# train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
 
-from search_space import *
+# from search_space import *
 
-ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
-ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")
+# ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
+# ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")

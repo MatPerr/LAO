@@ -48,14 +48,16 @@ def sample_and_visualize_latent_vectors(
     # Initialize preference functions (same as in the original code)
     params_pi_func = torch.nn.Sequential(
         trained_ae.params_predictor,
+        Lambda(lambda x: torch.maximum(torch.log(torch.Tensor([200_000]).to("mps")), x)),
         Lambda(lambda x: torch.clamp(x, min=0, max=30)),
-        Lambda(lambda x: x / 26),
+        Lambda(lambda x: x / 30),
         Lambda(lambda x: (x-0.5)*8),
         Lambda(lambda x: torch.sigmoid(-x))
     )
 
     FLOPs_pi_func = torch.nn.Sequential(
         trained_ae.FLOPs_predictor,
+        Lambda(lambda x: torch.maximum(torch.log(torch.Tensor([60_000_000]).to("mps")), x)),
         Lambda(lambda x: torch.clamp(x, min=0, max=60)),
         Lambda(lambda x: x / 60),
         Lambda(lambda x: (x-0.5)*8),
@@ -85,7 +87,7 @@ def sample_and_visualize_latent_vectors(
             return result
     
     # Create product pi function
-    prod_func = prod_pi_func([params_pi_func, FLOPs_pi_func, target_BBGP_pi_func])
+    prod_func = prod_pi_func([params_pi_func, FLOPs_pi_func])
     
     # Prepare data collection
     metrics = {
@@ -381,7 +383,7 @@ if __name__ == "__main__":
     # Create and load the autoencoder
     ae = ArcAE(search_space=search_space, z_dim=99, ae_type="WAE")
     # checkpoint = torch.load("checkpoints/arcae_20250403_083352/arcae_best.pt", map_location=device)
-    checkpoint = torch.load("checkpoints/arcae_20250403_092511/arcae_best.pt", map_location=device)
+    checkpoint = torch.load("checkpoints/arcae_20250405_103101/arcae_final.pt", map_location=device)
     ae.load_state_dict(checkpoint['model_state_dict'])
     ae.to(device)
     
