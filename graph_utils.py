@@ -595,7 +595,7 @@ class ArcGraph(ig.Graph):
         self.valid = True
         return True
     
-    def sample_node_features(self, input_shape):
+    def sample_node_features(self, input_shape, constraints = None):
         n_nodes = len(self.vs)
         
         def sample_for_node(node_idx, input_shape):
@@ -645,11 +645,31 @@ class ArcGraph(ig.Graph):
                         node_features[index] = np.random.choice(feature_values, p=self.search_space.node_feature_probs.__dict__[feature_name])            
             self.vs[node_idx]["features"] = node_features.tolist()
             self.vs[node_idx]["output_shape"] = [out_channels, input_shape[1] // stride]
-        
+
+        self.constraints_met = True        
+        n_params = 0
+        FLOPs = 0
+
         sample_for_node(0, input_shape)
+        self._add_node_n_params_and_FLOPs(0)
+
+        n_params += self.vs[0]['n_params']
+        FLOPs += self.vs[0]['FLOPs']
+        if constraints is not None:
+            if not all([eval(f"{key} <= {value[1]} and {key} >= {value[0]}") for key, value in constraints.items()]):
+                self.constraints_met = False
+
         for i in range(1, n_nodes):
             current_input_shape = self._get_input_shape(i)
             sample_for_node(i, current_input_shape)
+            self._add_node_n_params_and_FLOPs(i)
+
+            n_params += self.vs[i]['n_params']
+            FLOPs += self.vs[i]['FLOPs']
+            if constraints is not None:
+                if not all([eval(f"{key} <= {value[1]} and {key} >= {value[0]}") for key, value in constraints.items()]):
+                    self.constraints_met = False
+                    break
 
 
     def _make_node_valid(self, graph, node_idx, input_shape):
@@ -717,7 +737,7 @@ class ArcGraph(ig.Graph):
                         features[groups_idx] = 1
 
 
-    def to_blueprint(self, input_shape=[3, 32], num_classes=10):
+    def to_blueprint(self, input_shape=[3, 32], num_classes=10, enforce_max_preds=False, topological_sort=False):
         assert self.search_space is not None, "search_space must be provided to create a blueprint"
         blueprint = ArcGraph(search_space=self.search_space)
         
@@ -755,6 +775,13 @@ class ArcGraph(ig.Graph):
         # Process remaining nodes
         for i in range(1, self.vcount()):
             original_predecessors = self.predecessors(i)
+            
+            # Enforce maximum predecessors if requested
+            if enforce_max_preds and len(original_predecessors) > self.search_space.graph_features.max_preds:
+                # Sort predecessors by index in descending order (prioritize later nodes)
+                original_predecessors = sorted(original_predecessors, reverse=True)
+                # Keep only the max allowed number of predecessors
+                original_predecessors = original_predecessors[:self.search_space.graph_features.max_preds]
             
             # Get all predecessor output shapes in the blueprint graph
             pred_shapes = []
@@ -927,14 +954,96 @@ class ArcGraph(ig.Graph):
         blueprint.n_params = blueprint._count_params()
         blueprint.FLOPs = blueprint._count_FLOPs()
 
-        return blueprint
+        # Create a topologically sorted version of the blueprint
+        if not topological_sort:
+            return blueprint
+        else:
+            sorted_vertices = blueprint.topological_sorting()
+            sorted_blueprint = ArcGraph(search_space=self.search_space)
+            
+            # Create a mapping from old indices to new indices
+            old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_vertices)}
+            
+            # Add vertices in sorted order and copy their attributes
+            for new_idx, old_idx in enumerate(sorted_vertices):
+                sorted_blueprint.add_vertex()
+                # Copy all attributes from the original blueprint
+                for attr in blueprint.vs[old_idx].attribute_names():
+                    sorted_blueprint.vs[new_idx][attr] = blueprint.vs[old_idx][attr]
+            
+            # Add edges, translating from old indices to new indices
+            for edge in blueprint.get_edgelist():
+                old_source, old_target = edge
+                new_source, new_target = old_to_new[old_source], old_to_new[old_target]
+                sorted_blueprint.add_edge(new_source, new_target)
+            
+            # Copy global attributes
+            sorted_blueprint.valid = blueprint.valid
+            sorted_blueprint.shapes_added = blueprint.shapes_added
+            sorted_blueprint.params_and_FLOPs_added = blueprint.params_and_FLOPs_added
+            sorted_blueprint.n_params = blueprint.n_params
+            sorted_blueprint.FLOPs = blueprint.FLOPs
+            if hasattr(blueprint, 'BBGP'):
+                sorted_blueprint.BBGP = blueprint.BBGP
+            
+            return sorted_blueprint
 
 
-    def to_torch(self, input_shape=[3, 32], num_classes=10):
+    def _layer_blueprint(self):
+        """
+        Calculate the execution layers for parallel processing.
+        Each node is assigned to a layer based on the longest path from input.
+        Nodes in the same layer can be executed in parallel.
+        
+        Returns:
+            dict: Node indices mapped to their execution layer
+            dict: Execution layers (indices) mapped to lists of nodes in that layer
+        """
+        layer_of_node_dict = {}
+        visited = set()
+        
+        def dfs(node_idx):
+            if node_idx in visited:
+                return layer_of_node_dict[node_idx]
+            
+            visited.add(node_idx)
+            
+            # If no predecessors, this is layer 0
+            predecessors = self.predecessors(node_idx)
+            if not predecessors:
+                layer_of_node_dict[node_idx] = 0
+                return 0
+            
+            # Find the maximum layer among predecessors
+            max_layer = -1
+            for pred in predecessors:
+                pred_layer = dfs(pred)
+                max_layer = max(max_layer, pred_layer)
+            
+            # This node's layer is one more than its deepest predecessor
+            layer_of_node_dict[node_idx] = max_layer + 1
+            return layer_of_node_dict[node_idx]
+        
+        # Calculate layer for each node
+        for i in range(self.vcount()):
+            if i not in visited:
+                dfs(i)
+        
+        # Group nodes by layer for parallel execution
+        nodes_of_layer_dict = {}
+        for node, layer in layer_of_node_dict.items():
+            if layer not in nodes_of_layer_dict:
+                nodes_of_layer_dict[layer] = []
+            nodes_of_layer_dict[layer].append(node)
+        
+        return layer_of_node_dict, nodes_of_layer_dict
+
+
+    def to_torch(self, input_shape=[3, 32], num_classes=10, enforce_max_preds=False):
         import torch
         import torch.nn as nn
         
-        blueprint = self.to_blueprint(input_shape=input_shape, num_classes=num_classes)
+        blueprint = self.to_blueprint(input_shape=input_shape, num_classes=num_classes, enforce_max_preds=enforce_max_preds)
         
         class ArcGraphModel(nn.Module):
             def __init__(self, blueprint):
@@ -1028,17 +1137,28 @@ class ArcGraph(ig.Graph):
                         self.layers[f'classifier_{node_idx}'] = nn.Linear(in_features, num_classes)
                     
                     self.topology.append((node_idx, blueprint.predecessors(node_idx)))
+                
+                # Store the successor information to determine when tensors can be freed
+                self.successors = {i: [] for i in range(blueprint.vcount())}
+                for node_idx, predecessors in self.topology:
+                    for pred_idx in predecessors:
+                        self.successors[pred_idx].append(node_idx)
+                
+                # Store the final output node for reference
+                self.output_node = self.topology[-1][0]
             
             def forward(self, x):
                 outputs = {}
+                # Keep track of how many successors still need each tensor
+                remaining_uses = {i: len(self.successors[i]) for i in range(len(self.topology))}
                 
                 for node_idx, predecessors in self.topology:
-                    node_type = "original"
-                    if "node_type" in blueprint.vs[node_idx].attribute_names():
-                        node_type = blueprint.vs[node_idx]["node_type"]
+                    node_type = blueprint.vs[node_idx]["node_type"]
                     
                     if len(predecessors) == 0:
-                        if node_type == 'original':
+                        if not node_idx == 0:
+                            raise ValueError(f"Node {node_idx}, but only the first node may have indegree = 0")
+                        elif node_type == 'original':
                             x = self.layers[f'conv_{node_idx}'](x)
                             x = self.layers[f'bn_{node_idx}'](x)
                             x = self.layers[f'act_{node_idx}'](x)
@@ -1053,13 +1173,29 @@ class ArcGraph(ig.Graph):
                         if len(predecessors) == 1:
                             pred_idx = predecessors[0]
                             x = outputs[pred_idx]
+                            
+                            # Decrement usage count of predecessor
+                            remaining_uses[pred_idx] -= 1
+                            # Free memory if no longer needed
+                            if remaining_uses[pred_idx] == 0 and pred_idx != self.output_node:
+                                outputs[pred_idx] = None
                         else:
-                            pred_outputs = [outputs[pred_idx] for pred_idx in predecessors]
+                            pred_outputs = []
+                            for pred_idx in predecessors:
+                                pred_outputs.append(outputs[pred_idx])
+                                # Decrement usage count
+                                remaining_uses[pred_idx] -= 1
+                                # Free memory if no longer needed
+                                if remaining_uses[pred_idx] == 0 and pred_idx != self.output_node:
+                                    outputs[pred_idx] = None
                             
                             if node_type == 'original' or node_type == 'global_avg_pool':
                                 x = self.layers[f'agg_{node_idx}'](torch.stack(pred_outputs))
                             else:
                                 raise ValueError(f'{node_type} nodes may not have >1 predecessors, received {len(predecessors)}')
+                            
+                            # Clear the list to free up memory
+                            pred_outputs = None
                         
                         if node_type == 'original':
                             x = self.layers[f'conv_{node_idx}'](x)
@@ -1084,10 +1220,612 @@ class ArcGraph(ig.Graph):
                         
                         outputs[node_idx] = x
                 
-                return outputs[self.topology[-1][0]]
+                result = outputs[self.output_node]
+                # Clear the outputs dictionary to free remaining memory
+                outputs.clear()
+                return result
         
         model = ArcGraphModel(blueprint)
         return model
+    
+   
+    def to_keras(self, input_shape=(3, 32), num_classes=10, enforce_max_preds=False, backend = "torch"):
+        """
+        Convert the graph blueprint into a Keras model using the torch backend.
+
+        Args:
+            input_shape (tuple): Shape of the input tensor in channels-first format.
+                                (e.g., (channels, height))
+            num_classes (int): Number of output classes.
+            enforce_max_preds (bool): Whether to enforce maximum predecessor constraints.
+
+        Returns:
+            keras.Model: The constructed Keras model.
+        """
+        import os
+        os.environ["KERAS_BACKEND"] = backend
+        import keras
+        from keras.models import Model
+
+        # Custom SE layer rewritten for torch backend.
+        class KerasCustomSE(keras.layers.Layer):
+            def __init__(self, channels, reduction=16, **kwargs):
+                super(KerasCustomSE, self).__init__(**kwargs)
+                self.channels = channels
+                self.global_avg_pool = keras.layers.GlobalAveragePooling2D()
+                self.fc1 = keras.layers.Dense(channels // reduction, activation='relu')
+                self.fc2 = keras.layers.Dense(channels, activation='sigmoid')
+
+            def call(self, inputs):
+                # Assume inputs shape: (batch, channels, height, width)
+                se = self.global_avg_pool(inputs)  # results in shape (batch, channels)
+                se = self.fc1(se)
+                se = self.fc2(se)
+                # Reshape to (batch, channels, 1, 1) for broadcasting.
+                se = se.reshape(se.shape[0], self.channels, 1, 1)
+                return inputs * se
+
+        # Custom ChannelPad layer rewritten using torch tensor operations.
+        class KerasChannelPad(keras.layers.Layer):
+            def __init__(self, in_channels, out_channels, **kwargs):
+                super(KerasChannelPad, self).__init__(**kwargs)
+                self.in_channels = in_channels
+                self.out_channels = out_channels
+                if in_channels > out_channels:
+                    raise ValueError(f"in_channels (={in_channels}) must be inferior out_channels (={out_channels}) to use channel padding")
+                elif in_channels == out_channels:
+                    self.pad_layer = keras.layers.Identity()
+                else:
+                    self.pad_layer = keras.layers.ZeroPadding2D(padding=((0, out_channels-in_channels), (0, 0)))
+                self.perm =(0,2,1,3)
+
+            def call(self, inputs):
+                output = keras.ops.transpose(inputs, axes=self.perm)
+                output = self.pad_layer(output)
+                output = keras.ops.transpose(output, axes=self.perm)
+                return output
+
+        # Custom aggregation layer: sums a list of tensors.
+        class KerasAggTensors(keras.layers.Layer):
+            def __init__(self, aggregation='sum', **kwargs):
+                super(KerasAggTensors, self).__init__(**kwargs)
+                if aggregation != 'sum':
+                    raise NotImplementedError("Only 'sum' aggregation is implemented.")
+                self.aggregator = keras.layers.Add()
+
+            def call(self, inputs):
+                # Sum the list of tensors.
+                return self.aggregator(inputs)
+
+        # Generate a blueprint from the graph.
+        blueprint = self.to_blueprint(input_shape=input_shape, num_classes=num_classes, enforce_max_preds=enforce_max_preds)
+
+        # Topologically sort nodes.
+        visited = set()
+        execution_order = []
+        def visit(node_idx):
+            if node_idx in visited:
+                return
+            visited.add(node_idx)
+            for pred in blueprint.predecessors(node_idx):
+                visit(pred)
+            execution_order.append(node_idx)
+        for i in range(blueprint.vcount()):
+            visit(i)
+
+        # Create a topology list: each element is (node_index, list of predecessor indices).
+        topology = [(node_idx, blueprint.predecessors(node_idx)) for node_idx in execution_order]
+
+        # Define a Keras model that mirrors the blueprint.
+        class KerasArcGraphModel(Model):
+            def __init__(self, blueprint, topology):
+                super(KerasArcGraphModel, self).__init__()
+                self.n_params = blueprint.n_params
+                self.FLOPs = blueprint.FLOPs
+                self.BBGP = blueprint.BBGP
+
+                self.topology = topology
+                self.num_nodes = blueprint.vcount()
+                self.layers_dict = {}
+                # For nodes with multiple predecessors, use the aggregation layer.
+                self.agg_layer = KerasAggTensors('sum')
+
+                # Create a layer/block for each node in topological order.
+                for node_idx in execution_order:
+                    node = blueprint.vs[node_idx]
+                    # Determine node type; default to "original" if not set.
+                    node_type = node["node_type"] if "node_type" in node.attribute_names() else "original"
+                    if node_type == 'original':
+                        features = node['features']
+                        # Assume node['input_shape'] is in channels-first order.
+                        in_channels = node['input_shape'][0]
+                        out_channels = features[feature_index('out_channels', blueprint.search_space)]
+                        kernel_size = features[feature_index('kernel_size', blueprint.search_space)]
+                        stride = features[feature_index('stride', blueprint.search_space)]
+                        groups = features[feature_index('groups', blueprint.search_space)]
+                        if groups == -1:
+                            groups = in_channels
+                        block = keras.Sequential()
+                        block.add(keras.layers.Conv2D(filters=out_channels,
+                                                    kernel_size=kernel_size,
+                                                    strides=stride,
+                                                    padding='same',
+                                                    groups=groups,
+                                                    use_bias=True))
+                        block.add(keras.layers.BatchNormalization())
+                        block.add(keras.layers.ReLU())
+                        # Append SE block if defined.
+                        if "squeeze_excitation" in blueprint.search_space.node_features.__dict__:
+                            se = features[feature_index('squeeze_excitation', blueprint.search_space)]
+                            if se == 1:
+                                block.add(KerasCustomSE(out_channels))
+                        self.layers_dict[node_idx] = block
+
+                    elif node_type == 'breadth_adapter':
+                        reduc_factor = node['reduc_factor']
+                        self.layers_dict[node_idx] = keras.layers.MaxPooling2D(pool_size=(reduc_factor, reduc_factor),
+                                                                            strides=reduc_factor,
+                                                                            padding='same')
+
+                    elif node_type == 'channel_adapter':
+                        in_channels = node['input_shape'][0]
+                        out_channels = node['output_shape'][0]
+                        self.layers_dict[node_idx] = KerasChannelPad(in_channels, out_channels)
+
+                    elif node_type == 'global_avg_pool':
+                        self.layers_dict[node_idx] = keras.layers.GlobalAveragePooling2D()
+
+                    elif node_type == 'classifier':
+                        self.layers_dict[node_idx] = keras.layers.Dense(num_classes)
+                    else:
+                        raise ValueError(f"Unknown node type: {node_type}")
+
+            def call(self, inputs, training=False):
+                outputs = {}
+                # Process nodes in topological order.
+                for node_idx, preds in self.topology:
+                    if not preds:
+                        # For input nodes, apply the layer directly.
+                        x = self.layers_dict[node_idx](inputs)
+                        outputs[node_idx] = x
+                    else:
+                        # Aggregate outputs from predecessor nodes.
+                        pred_outputs = [outputs[p] for p in preds]
+                        if len(pred_outputs) > 1:
+                            aggregated = self.agg_layer(pred_outputs)
+                        else:
+                            aggregated = pred_outputs[0]
+                        x = self.layers_dict[node_idx](aggregated)
+                        outputs[node_idx] = x
+                # Return the output from the final node.
+                last_node = self.topology[-1][0]
+                return outputs[last_node]
+
+        input_tensor = keras.layers.Input(shape=(input_shape[0], input_shape[1], input_shape[1]))
+        keras_arc_model = KerasArcGraphModel(blueprint, topology)
+        output_tensor = keras_arc_model(input_tensor)
+        keras_model = keras.Model(inputs=input_tensor, outputs=output_tensor)
+        return keras_model
+
+
+    def memory_usage_animation(self, output_path=None, delays=50, backbone=True, plot_memory=True):
+        """
+        Create an animation showing how node outputs are created and freed from memory
+        during model forward execution using parallel processing where possible.
+        Also tracks and plots memory usage over time.
+        
+        Args:
+            output_path (str): Path to save the animation GIF
+            delays (int): Delay between frames in milliseconds
+            backbone (bool): Whether to emphasize backbone connections
+            plot_memory (bool): Whether to plot memory usage graph
+            
+        Returns:
+            tuple: (animation_path, memory_plot_path) or animation object
+        """
+        import os
+        import tempfile
+        import imageio
+        import matplotlib.pyplot as plt
+        import matplotlib.animation as animation
+        import pygraphviz as pgv
+        from copy import deepcopy
+        import matplotlib.image as mpimg
+        import numpy as np
+        
+        # Create a blueprint if not already one
+        if not hasattr(self, 'valid') or not self.valid:
+            print("Warning: Creating blueprint from invalid graph for visualization.")
+            blueprint = self
+        else:
+            blueprint = self
+        
+        # Calculate execution layers for parallel processing
+        node_layers, execution_groups = blueprint._layer_blueprint()
+        
+        # Count how many nodes depend on each node's output
+        dependency_count = {i: 0 for i in range(blueprint.vcount())}
+        for node in range(blueprint.vcount()):
+            for pred in blueprint.predecessors(node):
+                dependency_count[pred] += 1
+        
+        # Track memory state for animation
+        frames = []
+        current_state = {i: "not_computed" for i in range(blueprint.vcount())}
+        memory_usage = []
+        current_memory = 0
+        
+        # Helper function to calculate tensor memory size in bytes (32 bits per element)
+        def calc_tensor_memory(node_idx):
+            if "output_shape" not in blueprint.vs[node_idx].attribute_names():
+                return 0
+            
+            shape = blueprint.vs[node_idx]["output_shape"]
+            # Memory = channels * height * width * 4 bytes (32 bits)
+            return shape[0] * (shape[1] ** 2) * 4
+        
+        # Add initial frame
+        frames.append(deepcopy(current_state))
+        memory_usage.append(current_memory)
+        
+        # Process each layer in order
+        sorted_layers = sorted(execution_groups.keys())
+        
+        for layer in sorted_layers:
+            nodes_in_layer = execution_groups[layer]
+            
+            # First compute all nodes in this layer (they run in parallel)
+            for node in nodes_in_layer:
+                current_state[node] = "in_memory"
+                current_memory += calc_tensor_memory(node)
+            
+            # Add a frame after computing the entire layer
+            frames.append(deepcopy(current_state))
+            memory_usage.append(current_memory)
+            
+            # Then check which nodes can be freed after this layer
+            freed_memory = 0
+            freed_nodes = []
+            
+            for node_idx in range(blueprint.vcount()):
+                if current_state[node_idx] == "in_memory" and node_idx not in nodes_in_layer:
+                    # Check if this node is a predecessor to any node in future layers
+                    is_still_needed = False
+                    
+                    for future_layer in [l for l in sorted_layers if l > layer]:
+                        for future_node in execution_groups[future_layer]:
+                            if node_idx in blueprint.predecessors(future_node):
+                                is_still_needed = True
+                                break
+                        if is_still_needed:
+                            break
+                    
+                    if not is_still_needed:
+                        freed_nodes.append(node_idx)
+                        freed_memory += calc_tensor_memory(node_idx)
+            
+            # If any nodes were freed, create a new frame
+            if freed_nodes:
+                for node in freed_nodes:
+                    current_state[node] = "freed"
+                current_memory -= freed_memory
+                
+                frames.append(deepcopy(current_state))
+                memory_usage.append(current_memory)
+        
+        # Create a function to draw the graph with current memory state
+        def draw_state(state):
+            graph = pgv.AGraph(directed=True, strict=True, fontname='Helvetica', arrowtype='open')
+            cmap = plt.get_cmap('cool')
+            
+            # Define memory state colors
+            memory_colors = {
+                "not_computed": "#F5F5DC",  # Beige
+                "in_memory": "#FFA500",     # Orange
+                "freed": "#A9A9A9"          # Grey
+            }
+            
+            for idx in range(blueprint.vcount()):
+                # Use attribute check rather than get method
+                node_type = "original"
+                if "node_type" in blueprint.vs[idx].attribute_names():
+                    node_type = blueprint.vs[idx]["node_type"]
+                
+                # Get the memory state color
+                fillcolor = memory_colors[state[idx]]
+                
+                # Add layer information to node label
+                layer_info = f"Layer {node_layers[idx]}"
+                
+                if node_type == "original" and "features" in blueprint.vs[idx].attribute_names():
+                    features = blueprint.vs[idx]["features"]
+                    if blueprint.search_space and hasattr(blueprint.search_space, "aliases"):
+                        label_parts = []
+                        feature_names = list(blueprint.search_space.node_features.__dict__.keys())              
+                        for i, name in enumerate(feature_names):
+                            if i < len(features):
+                                alias = blueprint.search_space.aliases.get(name, name)
+                                label_parts.append(f"{alias}{features[i]}")
+                        
+                        label = f"({idx}) {layer_info}\n" + " ".join(label_parts)
+                    else:
+                        label = f"({idx}) {layer_info}\n{features}"
+                        
+                    fixedsize = False
+                    width = None
+                    height = None
+                    stride = features[feature_index("stride", blueprint.search_space)]
+                    shape = 'box'
+                    if stride > 1:
+                        fixedsize = True
+                        width = 2.5
+                        height = 0.9
+                        shape = 'invtrapezium'
+                    if "n_params" in blueprint.vs[idx].attribute_names():
+                        n_params = blueprint.vs[idx]["n_params"]
+                        label += f"\nparams: {format_number_spaces(n_params)}"
+                    if "FLOPs" in blueprint.vs[idx].attribute_names():
+                        FLOPs = blueprint.vs[idx]["FLOPs"]
+                        label += f"\nFLOPs: {format_number_spaces(FLOPs)}"
+                        
+                    graph.add_node(
+                        idx, 
+                        label=label, 
+                        color='black', 
+                        fillcolor=fillcolor, 
+                        shape=shape,
+                        style='filled',
+                        fixedsize=fixedsize,
+                        width=width,
+                        height=height,
+                        fontsize=12
+                    )
+                elif node_type == "breadth_adapter":
+                    reduc_factor = "?"
+                    if "reduc_factor" in blueprint.vs[idx].attribute_names():
+                        reduc_factor = blueprint.vs[idx]["reduc_factor"]
+                    label = f"({idx}) {layer_info}\nMaxPool {reduc_factor}"
+                    graph.add_node(
+                        idx, 
+                        label=label, 
+                        color='black', 
+                        fillcolor=fillcolor, 
+                        shape='invtrapezium',
+                        style='filled',
+                        width=1.4, 
+                        height=0.5,
+                        fixedsize=True,
+                        fontsize=12
+                    )
+                elif node_type == "channel_adapter":
+                    padding = "?"
+                    if "padding" in blueprint.vs[idx].attribute_names():
+                        padding = blueprint.vs[idx]["padding"]
+                    
+                    label = f"({idx}) {layer_info}\nChannelPad {padding}"
+                    graph.add_node(
+                        idx, 
+                        label=label, 
+                        color='black', 
+                        fillcolor=fillcolor, 
+                        shape='box',
+                        style='filled', 
+                        fontsize=12
+                    )
+                elif node_type == "global_avg_pool":
+                    label = f"({idx}) {layer_info}\nGlobalAvgPool"
+                    if "FLOPs" in blueprint.vs[idx].attribute_names():
+                        FLOPs = blueprint.vs[idx]["FLOPs"]
+                        label += f"\nFLOPs: {format_number_spaces(FLOPs)}"
+                    graph.add_node(
+                        idx, 
+                        label=label, 
+                        color='black', 
+                        fillcolor=fillcolor, 
+                        shape='invtrapezium',
+                        style='filled',
+                        width=2, 
+                        height=0.7,
+                        fixedsize=True,
+                        fontsize=12
+                    )
+                elif node_type == "classifier":
+                    label = f"({idx}) {layer_info}\nLinear"
+                    if "n_params" in blueprint.vs[idx].attribute_names():
+                        n_params = blueprint.vs[idx]["n_params"]
+                        label += f"\nparams: {format_number_spaces(n_params)}"
+                    if "FLOPs" in blueprint.vs[idx].attribute_names():
+                        FLOPs = blueprint.vs[idx]["FLOPs"]
+                        label += f"\nFLOPs: {format_number_spaces(FLOPs)}"
+                    graph.add_node(
+                        idx, 
+                        label=label, 
+                        color='black', 
+                        fillcolor=fillcolor, 
+                        shape='box',
+                        style='filled', 
+                        fontsize=12
+                    )
+                else:
+                    label = f"({idx}) {layer_info}"                
+                    graph.add_node(
+                        idx, 
+                        label=label, 
+                        color='black', 
+                        fillcolor=fillcolor, 
+                        shape='box',
+                        style='filled', 
+                        fontsize=12
+                    )
+            
+            # Add edges with latent size labels
+            for edge in blueprint.get_edgelist():
+                source, target = edge
+                
+                # Add both input and output shapes on edge labels
+                input_shape_label = ""
+                output_shape_label = ""
+                
+                # Get the output shape of the source node (edge start)
+                if "output_shape" in blueprint.vs[source].attribute_names():
+                    source_output = blueprint.vs[source]["output_shape"]
+                    output_shape_label = f" {source_output[0]}×{source_output[1]}²"
+                
+                # Get the input shape of the target node (edge end)
+                if "input_shape" in blueprint.vs[target].attribute_names():
+                    target_input = blueprint.vs[target]["input_shape"]
+                    input_shape_label = f" {target_input[0]}×{target_input[1]}²"
+                
+                # Combine labels if both exist
+                if output_shape_label and input_shape_label:
+                    if output_shape_label == input_shape_label:
+                        # If they're the same, just use one
+                        label = output_shape_label
+                    else:
+                        # If different, show both
+                        label = f" {output_shape_label}\n{input_shape_label}"
+                elif output_shape_label:
+                    label = output_shape_label
+                elif input_shape_label:
+                    label = input_shape_label
+                else:
+                    label = ""
+                
+                edge_weight = 1
+                if backbone and source == target - 1:
+                    edge_weight = 3
+                
+                if label:
+                    graph.add_edge(
+                        source, 
+                        target, 
+                        weight=edge_weight,
+                        label=label,
+                        fontsize=12,
+                        labeldistance=1.5,
+                        labelangle=0
+                    )
+                else:
+                    graph.add_edge(source, target, weight=edge_weight)
+            
+            graph.layout(prog='dot')
+            
+            # Create a temporary file for the frame
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                temp_path = tmp_file.name
+            
+            graph.draw(temp_path, prog='dot', args='-Gdpi=300')
+            return temp_path
+        
+        # Create a plot of memory usage over time
+        def plot_memory_usage():
+            plt.figure(figsize=(10, 6))
+            
+            # Convert to MB for readability
+            memory_mb = [m / (1024 * 1024) for m in memory_usage]
+            steps = list(range(len(memory_usage)))
+            
+            plt.plot(steps, memory_mb, 'b-', linewidth=2)
+            plt.fill_between(steps, 0, memory_mb, alpha=0.2, color='blue')
+            
+            plt.title('Memory Usage During Parallel Forward Pass', fontsize=14)
+            plt.xlabel('Execution Step', fontsize=12)
+            plt.ylabel('Memory Usage (MB)', fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            
+            # Mark execution layer boundaries with vertical lines
+            layer_boundaries = []
+            frame_idx = 0
+            for layer in sorted_layers:
+                # Add vertical line at the start of each layer's execution
+                if frame_idx < len(steps):
+                    plt.axvline(x=frame_idx, color='red', linestyle='--', alpha=0.5)
+                    plt.text(frame_idx, max(memory_mb)*1.02, f"Layer {layer}", 
+                            rotation=90, verticalalignment='bottom')
+                layer_boundaries.append(frame_idx)
+                frame_idx += 2  # Each layer has two frames (compute, then free)
+            
+            # Mark peak memory usage
+            peak_memory = max(memory_mb)
+            peak_step = memory_mb.index(peak_memory)
+            plt.scatter(peak_step, peak_memory, color='red', s=100, zorder=5)
+            plt.annotate(f'Peak: {peak_memory:.2f} MB', 
+                        xy=(peak_step, peak_memory),
+                        xytext=(peak_step + 1, peak_memory * 1.1),
+                        arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=8),
+                        fontsize=12)
+            
+            plt.tight_layout()
+            
+            # If saving animation, also save the memory plot
+            if output_path:
+                memory_plot_path = os.path.splitext(output_path)[0] + "_memory.png"
+                plt.savefig(memory_plot_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                return memory_plot_path
+            else:
+                # Return the figure for display
+                memory_fig = plt.gcf()
+                plt.close()
+                return memory_fig
+        
+        # Create all frames
+        frame_files = []
+        print(f"Generating {len(frames)} frames for memory usage animation...")
+        for i, state in enumerate(frames):
+            if i % 10 == 0:
+                print(f"Processing frame {i+1}/{len(frames)}...")
+            frame_files.append(draw_state(state))
+        
+        # Create the memory usage plot
+        memory_plot_output = None
+        if plot_memory:
+            print("Generating memory usage plot...")
+            memory_plot_output = plot_memory_usage()
+        
+        # Create the animation
+        if output_path:
+            directory = os.path.dirname(os.path.abspath(output_path))
+            os.makedirs(directory, exist_ok=True)
+            
+            print(f"Creating animation and saving to {output_path}...")
+            # Use imageio to create the GIF
+            with imageio.get_writer(output_path, mode='I', duration=delays/1000) as writer:
+                for file in frame_files:
+                    image = imageio.imread(file)
+                    writer.append_data(image)
+                    # Clean up temporary files
+                    try:
+                        os.remove(file)
+                    except:
+                        pass
+            
+            print("Animation created successfully!")
+            return (output_path, memory_plot_output)
+        else:
+            # Display animation in notebook if no output path
+            fig, ax = plt.subplots(figsize=(12, 8))
+            
+            def update(frame):
+                ax.clear()
+                img = plt.imread(frame_files[frame])
+                ax.imshow(img)
+                ax.axis('off')
+                return ax
+            
+            print("Creating animation for display...")
+            ani = animation.FuncAnimation(fig, update, frames=len(frame_files), interval=delays)
+            plt.close()
+            
+            # Clean up temporary files
+            for file in frame_files:
+                try:
+                    os.remove(file)
+                except:
+                    pass
+            
+            print("Animation ready for display!")
+            return (ani, memory_plot_output)
     
 
 

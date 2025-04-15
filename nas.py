@@ -269,8 +269,8 @@ class LSBO_problem:
         tag_prefix = f"model_{model_idx}" if model_idx is not None else "unknown_model"
 
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
-        scheduler = CosineAnnealingAlphaLR(optimizer, T_max=max_iterations, alpha=0.)
+        optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4)
+        scheduler = CosineAnnealingAlphaLR(optimizer, T_max=max_iterations, alpha=1e-4)
         
         best_acc = 0.0
         iteration = 0

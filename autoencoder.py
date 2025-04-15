@@ -1079,10 +1079,10 @@ class ArcAE(nn.Module):
 # data = torch.load("exp2403/graph_data/1000000_samples_0325_0013.pt")
 # data = torch.load("exp0204/graph_data/1000000_samples_0402_2300.pt")
 
-# data = torch.load("exp0304/graph_data/1000000_samples_0403_1706.pt")
-# train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
+data = torch.load("exp1404/graph_data/1000000_samples_0415_0240.pt")
+train_dl, val_dl = get_dataloaders(data["V"], data["Y"], train_split=0.99, batch_size=1024, num_workers=0)
 
-# from search_space import *
+from search_space import *
 
-# ae_model = ArcAE(search_space = SearchSpace(), z_dim = 99, ae_type = "WAE",)
-# ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")
+ae_model = ArcAE(search_space = SearchSpace(), z_dim = 79, ae_type = "WAE",)
+ae_model.train_loop(train_dl = train_dl, val_dl = val_dl, iterations=150_000, lr=5e-4, beta=1e-2, gamma=1e-3, log_dir="runs/arc_ae", save_dir="checkpoints")
