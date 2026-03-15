@@ -92,6 +92,19 @@ def worker_generate_sample(args: Any) -> Any:
 
 
 class DataGenerator:
+    """
+    Multiprocess graph-sample generator for architecture datasets.
+
+    The generator repeatedly samples valid architecture graphs under optional
+    constraints and persists tensors `(V, Y)` for downstream autoencoder training.
+
+    Args:
+        search_space (Any): Search-space definition used for sampling.
+        input_shape (Any): Input shape used for graph validation/costing.
+        exp_dir (Any): Output experiment directory.
+        constraints (Any): Optional metric bounds for sampled architectures.
+    """
+
     def __init__(self, search_space: Any, input_shape: Any, exp_dir: Any, constraints: Any = None) -> None:
         """
         Init.
@@ -142,6 +155,14 @@ class DataGenerator:
 
 
 class GraphDataset(Dataset):
+    """
+    Torch dataset wrapper for architecture vectors and target metrics.
+
+    Args:
+        V (Any): Architecture vectors.
+        Y (Any): Target metrics aligned with `V`.
+    """
+
     def __init__(self, V: Any, Y: Any) -> None:
         """
         Init.
@@ -183,6 +204,18 @@ class _RepeatSampler(object):
 
 
 class MultiEpochsDataLoader(DataLoader):
+    """
+    DataLoader that reuses a persistent iterator across epochs.
+
+    Args:
+        dataset (Any): Torch dataset instance.
+        batch_size (Any): Batch size.
+        shuffle (Any): Whether to shuffle samples.
+        num_workers (Any): Worker process count.
+        pin_memory (Any): Pin-memory toggle.
+        **kwargs (Any): Forwarded DataLoader kwargs.
+    """
+
     def __init__(
         self,
         dataset: Any,

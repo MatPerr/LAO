@@ -72,6 +72,15 @@ class NonNegativeLinear(nn.Linear):
 
 
 class ICNN(nn.Module):
+    """
+    Input-convex neural network used as a latent-space predictor head.
+
+    Args:
+        input_size (Any): Size of the input latent vector.
+        hs (Any): Hidden-layer width specification.
+        convex_flag (Any): If True, enforce non-negative hidden transitions.
+    """
+
     def __init__(self, input_size: Any, hs: Any, convex_flag: Any = True) -> None:
         """
         Init.
@@ -175,8 +184,15 @@ def MMD_RBF_gaussian_prior(
 
 class CodeNorm1d(nn.Module):
     """
-    A custom normalization layer for 1D input that performs only the normalization
-    part of BatchNorm1d without the learnable affine parameters.
+    Batch-like scalar normalization layer for latent codes.
+
+    The layer computes a single mean/variance over the full 2D code tensor and
+    applies normalization without learnable affine parameters.
+
+    Args:
+        eps (Any): Numerical stability epsilon.
+        momentum (Any): Running-statistics momentum.
+        track_running_stats (Any): Whether to maintain running moments.
     """
 
     def __init__(self, eps: Any = 1e-05, momentum: Any = 0.1, track_running_stats: Any = True) -> None:
@@ -358,6 +374,21 @@ def ordered_logistic_loss(predictions: Any, targets: Any, possible_values: Any, 
 
 
 class ArcAE(nn.Module):
+    """
+    Architecture autoencoder with auxiliary metric predictors.
+
+    The module encodes graph vectors into a latent space and decodes them back to
+    architecture vectors, while jointly training predictor heads for key architecture
+    metrics (log-params, log-FLOPs, log2-BBGP).
+
+    Args:
+        search_space (Any): Search-space definition used for feature dimensions.
+        ae_type (Any): Autoencoder mode (`AE`, `VAE`, or `WAE`).
+        encoder_hs (Any): Encoder hidden-layer sizes.
+        decoder_hs (Any): Decoder hidden-layer sizes.
+        z_dim (Any): Latent dimensionality.
+    """
+
     def __init__(
         self,
         search_space: Any,

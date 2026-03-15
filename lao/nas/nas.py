@@ -40,8 +40,20 @@ class Lambda(nn.Module):
 
 class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
     """
-    logPiEI(x) = log([EI*π](x)) = log(EI(x)) + log(π(x)),
-    where π is a provided weighting scheme (preference function)
+    Log Expected Improvement weighted by a preference function.
+
+    Implements:
+        logPiEI(x) = log(EI(x)) + (beta / n) * log(pi(x))
+
+    Args:
+        model (Model): Fitted surrogate model.
+        best_f (float | torch.Tensor): Current best observed objective.
+        posterior_transform (PosteriorTransform | None): Optional posterior transform.
+        pi_func (torch.nn.Module | None): Preference/priors over candidates.
+        beta (float): Preference weight.
+        n (int): Iteration index used for annealed weighting.
+        maximize (bool): Whether objective is maximized.
+        bounds (torch.Tensor | None): Unnormalization bounds for X.
     """
 
     _log: bool = True
@@ -97,8 +109,20 @@ class LogPiExpectedImprovement(AnalyticAcquisitionFunction):
 
 class PiExpectedImprovement(AnalyticAcquisitionFunction):
     """
-    PiEI(x) = EI(x)*π(x),
-    where π is a provided weighting scheme (preference function)
+    Expected Improvement weighted by a preference function.
+
+    Supports multiplicative and additive preference mixing modes.
+
+    Args:
+        model (Model): Fitted surrogate model.
+        best_f (float | torch.Tensor): Current best observed objective.
+        posterior_transform (PosteriorTransform | None): Optional posterior transform.
+        pi_func (torch.nn.Module | None): Preference/priors over candidates.
+        beta (float): Preference weight.
+        n (int): Iteration index used for annealed weighting.
+        maximize (bool): Whether objective is maximized.
+        mode (str): Preference combination mode (`mult`, `add`, `pi`).
+        bounds (torch.Tensor | None): Unnormalization bounds for X.
     """
 
     _log: bool = True
@@ -223,6 +247,27 @@ def ZQL(x: Any, x1: Any, x2: Any, m: Any) -> Any:
 
 
 class LSBO_problem:
+    """
+    Latent-space Bayesian optimization driver for architecture search.
+
+    This class orchestrates the NAS outer loop:
+    1. Decode latent vectors into architecture graphs via the trained autoencoder.
+    2. Evaluate candidates with task-specific cost/objective functions.
+    3. Fit/update a GP surrogate.
+    4. Optimize acquisition functions to propose the next latent candidate.
+
+    Args:
+        trained_ae (Any): Trained `ArcAE` model used for decode/predictors.
+        cost_function (Any): Objective/cost mode (`accuracy`, `params`, etc.).
+        dataset (Any): Dataset identifier used in candidate training.
+        input_shape (Any): Input tensor shape for compiled models.
+        num_classes (Any): Number of prediction classes.
+        custom_cost_fn (Any): Optional custom evaluator callable.
+        log_dir (Any): TensorBoard logging directory.
+        acquisition_type (Any): Acquisition type (`EI`, `logEI`, `PiEI`, ...).
+        pi_func (Any): Optional preference function for PiBO variants.
+    """
+
     def __init__(
         self,
         trained_ae: Any,

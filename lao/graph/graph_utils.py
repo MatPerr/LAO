@@ -134,6 +134,23 @@ def format_number_spaces(number: Any) -> Any:
 
 
 class ArcGraph(ig.Graph):
+    """
+    Directed architecture graph used throughout LAO.
+
+    This class stores node-level architecture features, edge connectivity, shape
+    propagation metadata, and derived cost statistics (parameters/FLOPs/BBGP). It
+    also exposes conversion helpers that compile the graph into downstream
+    representations (blueprint, PyTorch, Keras).
+
+    Args:
+        search_space (Any): Search-space definition used to interpret and validate
+            node features.
+        X (Any): Optional node-feature matrix used to initialize graph vertices.
+        A (Any): Optional adjacency matrix used to initialize graph edges.
+        V (Any): Optional flattened graph vector encoding (features + adjacency).
+        n_nodes (Any): Number of nodes to reconstruct when `V` is provided.
+    """
+
     def __init__(
         self, search_space: Any = None, X: Any = None, A: Any = None, V: Any = None, n_nodes: Any = None
     ) -> None:
