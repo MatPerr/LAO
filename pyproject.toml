@@ -1,0 +1,49 @@
+[project]
+name = "lao"
+version = "0.1.0"
+description = "Latent Architecture Optimization (LAO)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.4",
+  "torchvision>=0.19",
+  "tqdm>=4.66",
+  "botorch>=0.12",
+  "gpytorch>=1.13",
+  "torchsummary>=1.5.1",
+  "python-igraph>=0.11",
+  "pygraphviz>=1.14",
+  "matplotlib>=3.9",
+  "imageio>=2.36",
+  "tensorboard>=2.18",
+  "keras>=3.8",
+  "pillow>=10.4",
+]
+
+[project.optional-dependencies]
+profiling = [
+  "deepspeed>=0.16",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+  "pre-commit>=4.3.0",
+  "ruff>=0.13.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
